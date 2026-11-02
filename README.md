@@ -41,10 +41,6 @@ Settings live in ModConfig/SparkVS.json. The useful ones are DefaultDurationSec,
 
 Known quirk in this build: the default BundleFolder in the config points at the folder on my own PC. Before using .sparkvs capture, open ModConfig/SparkVS.json and set BundleFolder to a folder on your PC, or clear it so it falls back to the normal output folder. Plain start, stop and report are not affected by this.
 
-Install
-
-Drop SparkVS-0.2.0.zip in your Mods folder like any other mod. It is a universal mod and it is not required on the client or the server, so on a server only the person doing the profiling needs it. Built for game 1.22.0 and up, tested on 1.22.7.
-
 Notes
 
 This is a profiling tool, not a performance mod. It does not make the game faster, it tells you what is making it slow. Run a capture while the problem is actually happening, an idle capture of a healthy game mostly proves the game was idle.
