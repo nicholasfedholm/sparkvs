@@ -43,10 +43,11 @@ public sealed class SparkVSConfig
     /// <summary>
     /// Read VRAM through DXGI QueryVideoMemoryInfo. The 20261101 live audit showed DXGI 37 percent below PDH, but that was a counter-pairing error:
     /// DXGI CurrentUsage is resident memory and was compared with PDH Dedicated Usage, which is committed memory (Task Manager's column) and keeps
-    /// allocations the driver demoted. The corrected gate pairs DXGI with PDH Local Usage. The module stays off (false) until that gate passes in a
-    /// live settled run; gpu-memory.jsonl then says DXGI was switched off and why, and reports PDH only.
+    /// allocations the driver demoted. The corrected gate pairs DXGI with PDH Local Usage. That gate passed live 3/3 on 2026-11-02, so the module is on by default;
+    /// set false to switch it off, and gpu-memory.jsonl then says DXGI was switched off and reports PDH only.
     /// </summary>
-    public bool GpuMemoryDxgi { get; set; } = false;
+    // On by default since the 2026-11-02 live VRAM gate passed 3/3 (diff_pct -0.191, -0.189, -0.189; bar 10 pct).
+    public bool GpuMemoryDxgi { get; set; } = true;
 
     /// <summary>
     /// GPU time by render phase from GL timestamp queries, for gpu-phases.json (experimental). Only active during a bundle capture.

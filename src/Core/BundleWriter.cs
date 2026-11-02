@@ -120,7 +120,7 @@ public sealed class GpuRecorder
     public string? UnavailableReason { get; private set; }
     public string SetupNote { get; private set; } = "";
 
-    public const string DefaultDxgiOffReason = "GpuMemoryDxgi is false in SparkVS.json: the earlier 37 percent disagreement was a counter-pairing error (DXGI resident usage against PDH Dedicated, which is committed), and the module stays off until the corrected gate (DXGI against PDH Local Usage) passes in a live settled run, so only PDH is reported";
+    public const string DefaultDxgiOffReason = "DXGI reads were switched off in config (GpuMemoryDxgi=false in SparkVS.json), so only PDH is reported";
 
     public GpuRecorder(BundleClock clock, bool dxgiReads = true, string? dxgiOffReason = null)
     {

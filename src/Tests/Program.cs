@@ -777,7 +777,7 @@ Check("frame log self count zero", zero.AllocatedBytes == 0, zero.AllocatedBytes
         Check("vram header has gate and note", vh.TryGetProperty("vram_gate", out var vg) && vg.TryGetProperty("pair", out _) && vh.GetProperty("vram_gate_note").GetString()!.Contains("interop") && vh.GetProperty("pdh_independent_of_runner_pdh_csv").GetBoolean() == false);
         Check("vram stats carry the gate", vst.VramGate != null && vst.VramGate["pass"] == null);
     }
-    Check("vram default off reason explains the pairing error", GpuRecorder.DefaultDxgiOffReason.Contains("pairing error") && GpuRecorder.DefaultDxgiOffReason.Contains("GpuMemoryDxgi"));
+    Check("vram default off reason says switched off in config", GpuRecorder.DefaultDxgiOffReason.Contains("switched off in config") && GpuRecorder.DefaultDxgiOffReason.Contains("GpuMemoryDxgi"));
     try { Directory.Delete(vdir, true); } catch { }
 }
 
