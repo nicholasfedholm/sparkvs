@@ -31,6 +31,8 @@ Build the report for the last capture: summary.md, summary.json and profile.spee
 .sparkvs capture <seconds> <label>
 Run a capture and write the full bundle, then build the report. The bundle has the summary files plus context.json, allocations.json, chunk-pipeline.json, patch-map.json and gpu-phases.json.
 
+To turn a capture bundle into a self-contained HTML report, run python report/make_report.py (see the usage notes at the top of the script). GpuMemoryDxgi is on by default since the 2026-11-02 live VRAM gate passed 3/3 (DXGI local vs PDH Local within 0.2 pct, bar 10 pct).
+
 .sparkvs status
 Shows whether a capture is running and where the last one went.
 
