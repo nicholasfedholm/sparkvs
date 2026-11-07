@@ -22,9 +22,10 @@ public sealed class SparkVSConfig
     public string OutputFolder { get; set; } = "";
 
     /// <summary>
-    /// Where .sparkvs capture writes its bundle folders (one subfolder per capture). Empty falls back to OutputFolder.
+    /// Where .sparkvs capture writes its bundle folders (one subfolder per capture). Empty means resolved at runtime:
+    /// OutputFolder if set, else VintagestoryData/ModData/sparkvs/captures.
     /// </summary>
-    public string BundleFolder { get; set; } = @"C:\Users\<you>\vs_scratch\sparkvs\captures";
+    public string BundleFolder { get; set; } = "";
 
     public double SpikeThresholdMs { get; set; } = 50;
 
@@ -64,6 +65,12 @@ public sealed class SparkVSConfig
     /// <summary>Harmony patch map of the process, for patch-map.json.</summary>
     public bool PatchMap { get; set; } = true;
 
-    /// <summary>Folder holding the static inventories made by asset_inventory.py. The newest .json is copied into the bundle.</summary>
-    public string AssetInventoryFolder { get; set; } = @"C:\Users\<you>\vs_scratch\sparkvs\asset-inventory";
+    /// <summary>Folder holding the static inventories made by asset_inventory.py. The newest .json is copied into the bundle. Empty means resolved at runtime under VintagestoryData/ModData/sparkvs/asset-inventory.</summary>
+    public string AssetInventoryFolder { get; set; } = "";
+
+    /// <summary>Write a memory snapshot (top consumers) at the end of a bundle capture.</summary>
+    public bool MemorySnapshotOnCaptureEnd { get; set; } = true;
+
+    /// <summary>How many top entries the memory snapshot lists. Clamped to 1..200 at load.</summary>
+    public int MemoryTopN { get; set; } = 20;
 }

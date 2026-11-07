@@ -2,16 +2,20 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>SparkVS</AssemblyName>
-    <Version>0.2.0</Version>
+    <Version>0.3.0</Version>
     <RootNamespace>SparkVS</RootNamespace>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <NoWarn>$(NoWarn);CA1416</NoWarn>
-    <VSDir Condition="'$(VSDir)' == ''">C:\Users\<you>\AppData\Local\Programs\Optimum</VSDir>
+    <VSDir Condition="'$(VSDir)' == '' And '$(VINTAGE_STORY)' != ''">$(VINTAGE_STORY)</VSDir>
+    <VSDir Condition="'$(VSDir)' == '' And Exists('$(LOCALAPPDATA)\Programs\Optimum')">$(LOCALAPPDATA)\Programs\Optimum</VSDir>
+    <VSDir Condition="'$(VSDir)' == ''">$(APPDATA)\Vintagestory</VSDir>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <GenerateDependencyFile>false</GenerateDependencyFile>
+    <!-- Keeps the build machine's folder names out of the PDB path embedded in the DLL. -->
+    <PathMap>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/..'))=/src</PathMap>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\Core\*.cs" />
