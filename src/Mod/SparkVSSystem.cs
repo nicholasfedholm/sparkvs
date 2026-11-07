@@ -55,6 +55,7 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
     int gen0, gen1, gen2;
     bool autoReport;
     volatile bool reportRunning;
+    volatile bool memoryRunning;
 
     // Bundle captures only (.sparkvs capture, or autostart with the bundle flag).
     bool bundleMode;
@@ -171,9 +172,13 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
                 .WithDescription("Build summary.md, summary.json and the Speedscope file for the last capture")
                 .HandleWith(_ => OnReport())
             .EndSubCommand()
+            .BeginSubCommand("memory")
+                .WithDescription("Take a live managed heap snapshot now and write memory.md/csv/json per mod under ModData/sparkvs/memory-<time>. Pauses the game for about 3.5 s per 3 GB of heap.")
+                .HandleWith(_ => OnMemory())
+            .EndSubCommand()
             .BeginSubCommand("status")
                 .WithDescription("Show capture state")
-                .HandleWith(_ => TextCommandResult.Success($"SparkVS {state}. Last capture: {(lastCaptureDir.Length > 0 ? lastCaptureDir : "none")}"))
+                .HandleWith(_ => TextCommandResult.Success($"SparkVS {state}{(memoryRunning ? ", memory snapshot running" : "")}. Last capture: {(lastCaptureDir.Length > 0 ? lastCaptureDir : "none")}"))
             .EndSubCommand();
 
         api.Event.LevelFinalize += ScheduleAutostart;
@@ -191,6 +196,7 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
             api.StoreModConfig(loaded, file);
         }
         loaded.MaxDurationSec = Math.Clamp(loaded.MaxDurationSec, 1, HardMaxSeconds);
+        loaded.MemoryTopN = Math.Clamp(loaded.MemoryTopN, 1, 200);
         return loaded;
     }
 
@@ -252,13 +258,16 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
         if (capi == null) return TextCommandResult.Error("Client not ready");
         if (state != State.Idle) return TextCommandResult.Error("SparkVS is already " + state);
         if (reportRunning) return TextCommandResult.Error("A report is still building");
+        if (memoryRunning) return TextCommandResult.Error("A memory snapshot is still running");
 
         durationSeconds = Math.Clamp(seconds > 0 ? seconds : config.DefaultDurationSec, 1, config.MaxDurationSec);
         label = requestedLabel;
         bundleMode = bundle;
         autoReport = report;
         string root = bundle && config.BundleFolder.Length > 0 ? config.BundleFolder
-            : config.OutputFolder.Length > 0 ? config.OutputFolder : Path.Combine(GamePaths.DataPath, "ModData", "sparkvs");
+            : config.OutputFolder.Length > 0 ? config.OutputFolder
+            : bundle ? Path.Combine(GamePaths.DataPath, "ModData", "sparkvs", "captures")
+            : Path.Combine(GamePaths.DataPath, "ModData", "sparkvs");
         string name = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + (label.Length > 0 ? "-" + Sanitize(label) : "");
         captureDir = Path.Combine(root, name);
         Directory.CreateDirectory(captureDir);
@@ -493,7 +502,11 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
         var meta = BuildMeta(captureFps);
         var session = capture!;
         var dir = captureDir;
-        var thread = new Thread(() => FinishCapture(session, meta, dir))
+        // The resolver reads the mod list and loaded assemblies, so it is built here on the main thread.
+        InProcModResolver? memoryResolver = null;
+        if (bundleMode && config.MemorySnapshotOnCaptureEnd && capi != null)
+            Guard("memory resolver", () => memoryResolver = InProcModResolver.Build(capi));
+        var thread = new Thread(() => FinishCapture(session, meta, dir, memoryResolver))
         {
             IsBackground = true,
             Name = "SparkVS finish",
@@ -605,7 +618,7 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
 
     static bool IsUnder(string file, string dir) => file.StartsWith(dir, StringComparison.OrdinalIgnoreCase);
 
-    void FinishCapture(CaptureSession session, CaptureMeta meta, string dir)
+    void FinishCapture(CaptureSession session, CaptureMeta meta, string dir, IModResolver? memoryResolver)
     {
         string message;
         if (bundleMode) StopBundleSamplers();
@@ -617,6 +630,20 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
             meta.SamplerBytesAllocated = session.ReaderBytesAllocated;
             meta.NettraceBytes = session.TraceBytes;
             if (bundleMode) WriteBundle(dir, meta);
+            // The capture session has fully stopped here, so no other EventPipe session holds the runtime Type keyword.
+            // Gross per-mod allocation bytes are only built later from the trace by .sparkvs report, so the column stays empty.
+            if (bundleMode && memoryResolver != null)
+                Guard("memory", () =>
+                {
+                    memoryRunning = true;
+                    try
+                    {
+                        var snap = HeapDumpEventPipe.Capture(Environment.ProcessId, TimeSpan.FromSeconds(120), m => capi?.Logger.Debug("SparkVS memory: " + m));
+                        var table = MemoryReport.Build(snap, memoryResolver, null, GrossNote);
+                        MemoryReport.WriteCsvOnly(dir, table);
+                    }
+                    finally { memoryRunning = false; }
+                });
             File.WriteAllText(Path.Combine(dir, ReportBuilder.MetaFile), JsonSerializer.Serialize(meta));
             lastCaptureDir = dir;
             message = session.ReaderError != null
@@ -656,7 +683,7 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
             PatchMapCollector.TakeClient();
             BundleWriter.WriteJson(Path.Combine(dir, "patch-map.json"), PatchMapBuilder.Build(PatchMapCollector.Client, PatchMapCollector.Server, null, "no server side in this process, or its first game tick had not run when the capture ended"));
         });
-        Guard("asset inventory", () => BundleWriter.WriteJson(Path.Combine(dir, "asset-inventory.json"), AssetInventoryCopy.Build(config.AssetInventoryFolder, DateTime.Now)));
+        Guard("asset inventory", () => BundleWriter.WriteJson(Path.Combine(dir, "asset-inventory.json"), AssetInventoryCopy.Build(config.AssetInventoryFolder.Length > 0 ? config.AssetInventoryFolder : Path.Combine(GamePaths.DataPath, "ModData", "sparkvs", "asset-inventory"), DateTime.Now)));
         Guard("writer placeholders", () => BundleWriter.WritePlaceholdersForMissing(dir, "writer failed, see collection_errors in context.json"));
         if (heapSampler?.Errors > 0) bundleErrors.Add("heap sampler errors: " + heapSampler.Errors + ", last " + heapSampler.LastError);
         if (gpuSampler?.Errors > 0) bundleErrors.Add("gpu sampler errors: " + gpuSampler.Errors + ", last " + gpuSampler.LastError);
@@ -751,6 +778,71 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
         thread.Start();
     }
 
+    const string GrossNote = "not measured: run a capture for gross allocations";
+
+    TextCommandResult OnMemory()
+    {
+        if (capi == null) return TextCommandResult.Error("Client not ready");
+        if (memoryRunning) return TextCommandResult.Error("A memory snapshot is already running");
+        if (state != State.Idle) return TextCommandResult.Error("SparkVS is " + state + ", take a memory snapshot when no capture is running");
+        InProcModResolver resolver;
+        try { resolver = InProcModResolver.Build(capi); }
+        catch (Exception ex) { return TextCommandResult.Error("SparkVS memory: could not build the mod map: " + ex.Message); }
+        int topN = config.MemoryTopN;
+        string frontEnd = "SparkVS mod " + BuildInfo.SparkVsVersion;
+        string dir = Path.Combine(GamePaths.DataPath, "ModData", "sparkvs", "memory-" + DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture));
+        memoryRunning = true;
+        var thread = new Thread(() =>
+        {
+            string message;
+            try
+            {
+                var snap = HeapDumpEventPipe.Capture(Environment.ProcessId, TimeSpan.FromSeconds(120), m => capi?.Logger.Debug("SparkVS memory: " + m));
+                var table = MemoryReport.Build(snap, resolver, null, GrossNote);
+                MemoryReport.Write(dir, table, topN, frontEnd);
+                message = MemorySummary(table, dir);
+            }
+            catch (Exception ex)
+            {
+                message = "SparkVS memory: snapshot failed: " + ex.Message;
+                capi?.Logger.Error("SparkVS memory: snapshot failed: " + ex);
+            }
+            finally { memoryRunning = false; }
+            Tell(message);
+        })
+        {
+            IsBackground = true,
+            Name = "SparkVS memory",
+        };
+        thread.Start();
+        return TextCommandResult.Success("SparkVS: taking a heap snapshot, the game pauses for a few seconds.");
+    }
+
+    static string MemorySummary(MemoryTable table, string dir)
+    {
+        var inv = CultureInfo.InvariantCulture;
+        string Mb(long bytes) => MemoryReport.Mb(bytes).ToString("0.0", inv);
+        var top = new List<string>();
+        foreach (var row in table.Rows)
+        {
+            if (row.Kind != OwnerKind.Mod || top.Count >= 5) continue;
+            top.Add(row.Name + " " + Mb(row.LiveBytes) + " MB");
+        }
+        long shared = 0, unknown = 0;
+        foreach (var row in table.Rows)
+        {
+            if (row.Kind == OwnerKind.Shared) shared += row.LiveBytes;
+            else if (row.Kind == OwnerKind.Unknown) unknown += row.LiveBytes;
+        }
+        var snap = table.Snapshot;
+        string text = "SparkVS memory: live " + Mb(table.TotalLiveBytes) + " MB in " + table.TotalLiveObjects.ToString("N0", inv) + " objects, dump pause "
+            + snap.GcPauseMs.ToString("0", inv) + " ms. Top mods: " + (top.Count > 0 ? string.Join(", ", top) : "none") + ". system/shared " + Mb(shared)
+            + " MB, unknown " + Mb(unknown) + " MB.";
+        if (!snap.Complete) text += " Snapshot incomplete.";
+        if (snap.Warnings.Count > 0) text += " Warnings: " + snap.Warnings.Count + " (see memory.md).";
+        return text + " Folder: " + dir;
+    }
+
     void Tell(string message)
     {
         capi?.Logger.Notification(message);
@@ -770,7 +862,7 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
             if (bundleMode) EndBundleState();
             var meta = BuildMeta(frames.Frames / ((now - phaseStartStamp) / (double)Stopwatch.Frequency));
             autoReport = false;
-            FinishCapture(capture!, meta, captureDir);
+            FinishCapture(capture!, meta, captureDir, null);
         }
         base.Dispose();
     }

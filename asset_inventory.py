@@ -21,7 +21,7 @@ except Exception:  # pragma: no cover
     _json5 = None
 
 SCHEMA_VERSION = 1
-DEFAULT_MODS = r"C:\Users\<you>\AppData\Roaming\VintagestoryData\Mods"
+DEFAULT_MODS = os.path.join(os.environ.get("APPDATA", ""), "VintagestoryData", "Mods")
 DEFAULT_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "asset-inventory")
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 SOUND_EXT = (".ogg", ".wav")

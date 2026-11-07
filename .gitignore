@@ -4,3 +4,7 @@ out/
 captures/
 *.nettrace
 *.zip
+*.dll
+*.pdb
+*.exe
+publish/

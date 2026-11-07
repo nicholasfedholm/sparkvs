@@ -431,7 +431,7 @@ Check("frame log self count zero", zero.AllocatedBytes == 0, zero.AllocatedBytes
     Check("chunk disabled form", !ChunkPipelineWriter.Disabled("off")["enabled"]!.GetValue<bool>());
 
     // Hook targets resolve against the game's own assemblies (Optimum install). Skipped, not failed, if the install is absent.
-    string optimum = @"C:\Users\<you>\AppData\Local\Programs\Optimum";
+    string optimum = Environment.GetEnvironmentVariable("VINTAGE_STORY") is { Length: > 0 } vsEnv ? vsEnv : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Optimum");
     if (File.Exists(Path.Combine(optimum, "VintagestoryLib.dll")))
     {
         System.Reflection.Assembly? Resolve(object? s, ResolveEventArgs a)
@@ -781,6 +781,67 @@ Check("frame log self count zero", zero.AllocatedBytes == 0, zero.AllocatedBytes
     try { Directory.Delete(vdir, true); } catch { }
 }
 
+// Memory report: the three files, the honest limits, and the exact CSV header (literal copies of DESIGN-memory.md).
+{
+    var msnap = new HeapSnapshot
+    {
+        Route = "A: test", Pid = 1, ProcessName = "test", TakenUtc = DateTime.UtcNow, Complete = true, LiveBytes = 3000, LiveObjects = 30,
+        Types =
+        {
+            new HeapTypeStat { TypeId = 1, TypeName = "ModA.Thing", Module = "C:\\mods\\moda\\ModA.dll", Count = 10, Bytes = 1000 },
+            new HeapTypeStat { TypeId = 2, TypeName = "System.String", Module = "System.Private.CoreLib.dll", Count = 10, Bytes = 1500 },
+            new HeapTypeStat { TypeId = 3, TypeName = "Mystery.Blob", Module = "MysteryAsm", Count = 10, Bytes = 500 },
+        },
+    };
+    var mtable = MemoryReport.Build(msnap, new TestResolver("ModA", "moda"), null, "not measured");
+    string mdir = Path.Combine(Path.GetTempPath(), "sparkvs-mem-" + Guid.NewGuid().ToString("N"));
+    MemoryReport.Write(mdir, mtable, 20, "SparkVS tests");
+    Check("memory report writes md, csv and json", File.Exists(Path.Combine(mdir, "memory.md")) && File.Exists(Path.Combine(mdir, "memory.csv")) && File.Exists(Path.Combine(mdir, "memory.json")));
+    string mmd = File.ReadAllText(Path.Combine(mdir, "memory.md"));
+    Check("memory.md has the four honest limits", mmd.Contains("Live managed heap only, attributed by object type to owning assembly to owning mod. Game, VintagestoryAPI, System.*, Microsoft.*, and shared Harmony go to system/shared. Unmapped goes to unknown. Nothing is guessed.")
+        && mmd.Contains("Content-only mods (JSON, no DLL) hold their data inside game types, so their footprint lands in system/shared.")
+        && mmd.Contains("Native and unmanaged memory, including GPU / VRAM, is not per-mod separable and is not in this table (see the capture's gpu-memory output).")
+        && mmd.Contains("Gross allocations are not live RAM. The two columns are separate and never merged."));
+    var mcsv = File.ReadAllLines(Path.Combine(mdir, "memory.csv"));
+    Check("memory csv header matches the spec exactly", mcsv[0] == "rank,owner_kind,owner_id,owner_name,live_bytes,live_mb,live_objects,pct_of_live_heap,gross_alloc_bytes,top_types", mcsv[0]);
+    Check("memory csv rows: mod first, then shared and unknown", mcsv.Length == 4 && mcsv[1].Split(',')[2] == "system/shared" && mcsv.Any(l => l.Contains(",moda,")) && mcsv.Any(l => l.Contains(",unknown,")), string.Join("|", mcsv));
+    string mcdir = Path.Combine(mdir, "csvonly");
+    MemoryReport.WriteCsvOnly(mcdir, mtable);
+    Check("WriteCsvOnly writes only memory.csv", Directory.GetFiles(mcdir).Length == 1 && File.Exists(Path.Combine(mcdir, "memory.csv")));
+    try { Directory.Delete(mdir, true); } catch { }
+}
+
+// Memory known-answer, in process: allocate the payload, measure expected with GC.GetTotalMemory, snapshot our own pid.
+{
+    long kBefore = GC.GetTotalMemory(true);
+    var kNodes = new PayloadNode[200_000];
+    for (int i = 0; i < kNodes.Length; i++) kNodes[i] = new PayloadNode { F0 = i, F14 = i };
+    var kCells = new PayloadCell[700_000];
+    for (int i = 0; i < kCells.Length; i++) kCells[i].A = i;
+    long kExpected = GC.GetTotalMemory(true) - kBefore;
+    HeapSnapshot? ksnap = null;
+    Exception? kerr = null;
+    var kthread = new Thread(() =>
+    {
+        try { ksnap = HeapDumpEventPipe.Capture(Environment.ProcessId, TimeSpan.FromMinutes(2), null); }
+        catch (Exception ex) { kerr = ex; }
+    }) { IsBackground = true, Name = "memory known-answer" };
+    kthread.Start();
+    kthread.Join();
+    long kAttributed = 0;
+    double kErrPct = 100;
+    if (ksnap != null)
+    {
+        var ktable = MemoryReport.Build(ksnap, new TestResolver("sparkvs-tests", "known-answer"), null, "");
+        foreach (var r in ktable.Rows) if (r.Id == "known-answer") kAttributed = r.LiveBytes;
+        kErrPct = kExpected > 0 ? 100.0 * (kAttributed - kExpected) / kExpected : 100;
+        Console.WriteLine($"memory known-answer: expected={kExpected} attributed={kAttributed} error={kErrPct:0.00}% pause={ksnap.GcPauseMs:0.0} ms complete={ksnap.Complete} lost={ksnap.EventsLost}");
+    }
+    Check("memory known-answer in-process", ksnap != null && ksnap.Complete && Math.Abs(kErrPct) <= 20, kerr?.Message ?? $"expected {kExpected} attributed {kAttributed} error {kErrPct:0.00}%");
+    GC.KeepAlive(kNodes);
+    GC.KeepAlive(kCells);
+}
+
 Console.WriteLine($"tests passed={passed} failed={failed}");
 return failed == 0 ? 0 : 1;
 
@@ -798,5 +859,33 @@ sealed class FakeGpuTimer : IGpuTimer
     {
         if (NotReady?.Invoke(values[id]) ?? false) ResultBeforeReady++;
         return values[id];
+    }
+}
+
+// Known-answer payload (same shape as tools/sparkx/KnownAnswerTarget); lives in the sparkvs-tests assembly.
+public sealed class PayloadNode
+{
+    public long F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14;
+}
+
+public struct PayloadCell
+{
+    public long A, B, C, D;
+}
+
+sealed class TestResolver : IModResolver
+{
+    readonly string assembly, id;
+    public TestResolver(string assembly, string id) { this.assembly = assembly; this.id = id; }
+    public string Describe => "test resolver: " + assembly + " is the mod " + id;
+
+    public Owner Resolve(string module)
+    {
+        string f = Path.GetFileNameWithoutExtension(module.Replace('/', '\\'));
+        if (f.Equals(assembly, StringComparison.OrdinalIgnoreCase)) return new Owner(OwnerKind.Mod, id, assembly);
+        if (f.StartsWith("System", StringComparison.OrdinalIgnoreCase) || f.StartsWith("Microsoft", StringComparison.OrdinalIgnoreCase)
+            || f.StartsWith("mscorlib", StringComparison.OrdinalIgnoreCase) || f.StartsWith("netstandard", StringComparison.OrdinalIgnoreCase))
+            return new Owner(OwnerKind.Shared, MemoryReport.SharedId, MemoryReport.SharedId);
+        return new Owner(OwnerKind.Unknown, MemoryReport.UnknownId, MemoryReport.UnknownId);
     }
 }
