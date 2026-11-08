@@ -89,3 +89,100 @@ public sealed class Attribution
         return -1;
     }
 }
+
+public enum AssemblyKind { None, Game, Framework }
+
+/// <summary>
+/// Shared classification of a module (a path or a simple assembly name) into a named bucket, used by the memory report in
+/// the mod (InProcModResolver) and in sparkx (ExternalModResolver). Game assemblies become "game:Name", framework assemblies
+/// "framework:Name". Anything else is None and stays with the resolver (mods) or goes to unknown. Nothing is guessed from
+/// partial name matches except the documented prefixes.
+/// </summary>
+public readonly struct AssemblyBucket
+{
+    public AssemblyKind Kind { get; }
+    public string Assembly { get; }
+    public string Bucket { get; }
+    public AssemblyBucket(AssemblyKind kind, string assembly)
+    {
+        Kind = kind;
+        Assembly = assembly;
+        Bucket = kind == AssemblyKind.Game ? "game:" + assembly : kind == AssemblyKind.Framework ? "framework:" + assembly : "";
+    }
+}
+
+public static class AssemblyBuckets
+{
+    /// <summary>Exact game assembly names (canonical casing).</summary>
+    public static readonly string[] GameExact =
+    {
+        "VintagestoryAPI", "VintagestoryLib", "VSEssentials", "VSSurvivalMod", "VSCreativeMod", "Vintagestory", "VintagestoryServer",
+        "Optimum", "cairo-sharp", "OpenTK", "protobuf-net", "Newtonsoft.Json", "0Harmony", "SkiaSharp",
+    };
+
+    /// <summary>Game assembly name prefixes (Optimum*, OpenTK.*, protobuf-net.*, SkiaSharp.*).</summary>
+    public static readonly string[] GamePrefixes = { "Optimum", "OpenTK.", "protobuf-net.", "SkiaSharp." };
+
+    static readonly string[] RuntimeDirs = { "\\dotnet\\shared\\", "\\Microsoft.NETCore.App\\", "\\Microsoft.WindowsDesktop.App\\" };
+
+    /// <summary>Simple assembly name of a module: file name without a .dll or .exe extension.</summary>
+    public static string SimpleName(string module)
+    {
+        if (string.IsNullOrEmpty(module)) return "";
+        string f = module.Replace('/', '\\');
+        int i = f.LastIndexOf('\\');
+        if (i >= 0) f = f.Substring(i + 1);
+        if (f.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            f = f.Substring(0, f.Length - 4);
+        return f;
+    }
+
+    public static bool IsGameName(string name)
+    {
+        if (name.Length == 0) return false;
+        foreach (var g in GameExact) if (name.Equals(g, StringComparison.OrdinalIgnoreCase)) return true;
+        foreach (var p in GamePrefixes) if (name.StartsWith(p, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    public static bool IsFrameworkName(string name)
+    {
+        if (name.Length == 0) return false;
+        return name.Equals("System", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("System.", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("mscorlib", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("netstandard", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("WindowsBase", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("coreclr", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("clrjit", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Order: game names, framework names, runtime directories, then (only when gameDir is given) any path under the game install dir.
+    /// Pass gameDir null for the name and runtime-folder rules only, so a resolver can look for mods before the install-dir rule.
+    /// </summary>
+    public static AssemblyBucket Classify(string module, string? gameDir = null)
+    {
+        if (string.IsNullOrEmpty(module)) return new AssemblyBucket(AssemblyKind.None, "");
+        string path = module.Replace('/', '\\');
+        string name = SimpleName(path);
+        if (name.Length == 0) return new AssemblyBucket(AssemblyKind.None, "");
+        if (IsGameName(name)) return new AssemblyBucket(AssemblyKind.Game, CanonicalGameName(name));
+        if (IsFrameworkName(name)) return new AssemblyBucket(AssemblyKind.Framework, name);
+        foreach (var d in RuntimeDirs)
+            if (path.IndexOf(d, StringComparison.OrdinalIgnoreCase) >= 0) return new AssemblyBucket(AssemblyKind.Framework, name);
+        if (!string.IsNullOrEmpty(gameDir) && path.IndexOf('\\') >= 0)
+        {
+            string dir = gameDir!.Replace('/', '\\').TrimEnd('\\') + "\\";
+            if (path.StartsWith(dir, StringComparison.OrdinalIgnoreCase)) return new AssemblyBucket(AssemblyKind.Game, name);
+        }
+        return new AssemblyBucket(AssemblyKind.None, "");
+    }
+
+    static string CanonicalGameName(string name)
+    {
+        foreach (var g in GameExact) if (name.Equals(g, StringComparison.OrdinalIgnoreCase)) return g;
+        return name;
+    }
+}

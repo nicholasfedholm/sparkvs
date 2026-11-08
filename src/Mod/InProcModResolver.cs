@@ -14,7 +14,6 @@ namespace SparkVS;
 /// </summary>
 public sealed class InProcModResolver : IModResolver
 {
-    static readonly Owner SharedOwner = new(OwnerKind.Shared, MemoryReport.SharedId, MemoryReport.SharedId);
     static readonly Owner UnknownOwner = new(OwnerKind.Unknown, MemoryReport.UnknownId, MemoryReport.UnknownId);
 
     readonly Dictionary<string, Owner> modByAssembly = new(StringComparer.OrdinalIgnoreCase);
@@ -90,11 +89,15 @@ public sealed class InProcModResolver : IModResolver
         if (norm.IndexOf('\\') >= 0)
             foreach (var (dir, owner) in folders)
                 if (IsUnder(norm, dir)) return owner;
-        if (gameAssemblies.Contains(name)) return SharedOwner;
-        if (norm.IndexOf('\\') >= 0 && IsUnder(norm, gameDir)) return SharedOwner;
-        if (Attribution.IsRuntimeModule(name) || name.Equals("0Harmony", StringComparison.OrdinalIgnoreCase)) return SharedOwner;
+        // Shared owners carry the named bucket in Name (game:<Assembly> or framework:<Assembly>); the Id stays system/shared.
+        var ab = AssemblyBuckets.Classify(norm, gameDir);
+        if (ab.Kind != AssemblyKind.None) return SharedNamed(ab.Bucket);
+        if (gameAssemblies.Contains(name)) return SharedNamed("game:" + name);
+        if (Attribution.IsRuntimeModule(name)) return SharedNamed("framework:" + name);
         return UnknownOwner;
     }
+
+    static Owner SharedNamed(string bucket) => new(OwnerKind.Shared, MemoryReport.SharedId, bucket);
 
     static string SafeLocation(Assembly assembly)
     {

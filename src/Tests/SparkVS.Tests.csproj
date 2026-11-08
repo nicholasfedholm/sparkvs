@@ -9,7 +9,7 @@
     <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="..\Core\Model.cs;..\Core\Attribution.cs;..\Core\Analyzer.cs;..\Core\Speedscope.cs;..\Core\SummaryWriter.cs;..\Core\FrameLog.cs;..\Core\BuildInfo.cs;..\Core\BundleClock.cs;..\Core\TickLog.cs;..\Core\PeriodicSampler.cs;..\Core\GpuMemory.cs;..\Core\BundleWriter.cs;..\Core\PatchMap.cs;..\Core\LoadPhases.cs;..\Core\AssetInventoryCopy.cs;..\Core\ExtraSections.cs;..\Core\ChunkPipeline.cs;..\Core\AllocationReport.cs;..\Core\NettraceLoader.cs;..\Core\CaptureSession.cs;..\Core\ReportBuilder.cs;..\Core\GpuPhases.cs;..\Core\HeapSnapshot.cs;..\Core\HeapDumpEventPipe.cs;..\Core\MemoryReport.cs" />
+    <Compile Include="..\Core\Model.cs;..\Core\Attribution.cs;..\Core\Analyzer.cs;..\Core\Speedscope.cs;..\Core\SummaryWriter.cs;..\Core\FrameLog.cs;..\Core\BuildInfo.cs;..\Core\BundleClock.cs;..\Core\TickLog.cs;..\Core\PeriodicSampler.cs;..\Core\GpuMemory.cs;..\Core\BundleWriter.cs;..\Core\PatchMap.cs;..\Core\LoadPhases.cs;..\Core\AssetInventoryCopy.cs;..\Core\ExtraSections.cs;..\Core\ChunkPipeline.cs;..\Core\AllocationReport.cs;..\Core\NettraceLoader.cs;..\Core\CaptureSession.cs;..\Core\ReportBuilder.cs;..\Core\GpuPhases.cs;..\Core\HeapSnapshot.cs;..\Core\HeapDumpEventPipe.cs;..\Core\MemoryReport.cs;..\Core\EntityCensus.cs;..\Core\EventLog.cs;..\Core\EntityTickTiming.cs;..\Mod\SparkVSConfig.cs" />
     <PackageReference Include="Microsoft.Diagnostics.NETCore.Client" Version="0.2.661903" />
     <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.1.28" />
   </ItemGroup>

@@ -20,7 +20,6 @@ public sealed class ExternalModResolver : IModResolver
     readonly Dictionary<string, Owner> modsByDllName = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, Owner> cache = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, Owner?> modinfoCache = new(StringComparer.OrdinalIgnoreCase);
-    static readonly Owner Shared = new(OwnerKind.Shared, MemoryReport.SharedId, MemoryReport.SharedId);
     static readonly Owner Unknown = new(OwnerKind.Unknown, MemoryReport.UnknownId, MemoryReport.UnknownId);
 
     public string Describe { get; private set; } = "";
@@ -181,15 +180,10 @@ public sealed class ExternalModResolver : IModResolver
         if (simple.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) || simple.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
             simple = simple.Substring(0, simple.Length - 4);
 
-        if (simple.StartsWith("System.", StringComparison.OrdinalIgnoreCase) || simple.Equals("System", StringComparison.OrdinalIgnoreCase)
-            || simple.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase) || simple.Equals("mscorlib", StringComparison.OrdinalIgnoreCase)
-            || simple.Equals("netstandard", StringComparison.OrdinalIgnoreCase) || simple.Equals("WindowsBase", StringComparison.OrdinalIgnoreCase)
-            || simple.Equals("0Harmony", StringComparison.OrdinalIgnoreCase))
-            return Shared;
-        if (path.IndexOf("\\dotnet\\shared\\", StringComparison.OrdinalIgnoreCase) >= 0
-            || path.IndexOf("\\Microsoft.NETCore.App\\", StringComparison.OrdinalIgnoreCase) >= 0
-            || path.IndexOf("\\Microsoft.WindowsDesktop.App\\", StringComparison.OrdinalIgnoreCase) >= 0)
-            return Shared;
+        // Game assemblies by name (VintagestoryAPI, ...) and framework assemblies by name or runtime folder. Bare module names
+        // (no path) are covered here, which the install-dir rule below cannot do. The named bucket goes in Owner.Name.
+        var named = AssemblyBuckets.Classify(path);
+        if (named.Kind != AssemblyKind.None) return new Owner(OwnerKind.Shared, MemoryReport.SharedId, named.Bucket);
 
         bool rooted = Path.IsPathRooted(path);
         if (rooted)
@@ -211,7 +205,7 @@ public sealed class ExternalModResolver : IModResolver
             }
 
             if (installDir != null && path.StartsWith(installDir + "\\", StringComparison.OrdinalIgnoreCase))
-                return Shared;
+                return new Owner(OwnerKind.Shared, MemoryReport.SharedId, "game:" + simple);
         }
 
         if (modsByDllName.TryGetValue(simple + ".dll", out var byName)) return byName;

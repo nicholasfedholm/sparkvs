@@ -29,7 +29,7 @@ internal static class ServerInfo
 
 internal sealed class ModEntry
 {
-    public string ModId = "", Version = "", SourcePath = "", SourceType = "";
+    public string ModId = "", Name = "", Version = "", SourcePath = "", SourceType = "";
     public HashSet<string> Sides = new(StringComparer.Ordinal);
 }
 
@@ -80,20 +80,21 @@ internal static class ContextCollector
     public static List<ModEntry> ModList(ICoreClientAPI capi)
     {
         var byId = new Dictionary<string, ModEntry>(StringComparer.OrdinalIgnoreCase);
-        void Add(string id, string? version, string? path, string type, string side)
+        void Add(string id, string? version, string? path, string type, string side, string? name = null)
         {
             if (string.IsNullOrEmpty(id)) return;
-            if (!byId.TryGetValue(id, out var e)) byId[id] = e = new ModEntry { ModId = id, Version = version ?? "", SourcePath = path ?? "", SourceType = type };
+            if (!byId.TryGetValue(id, out var e)) byId[id] = e = new ModEntry { ModId = id, Name = name ?? "", Version = version ?? "", SourcePath = path ?? "", SourceType = type };
+            else if (e.Name.Length == 0 && name != null) e.Name = name;
             e.Sides.Add(side);
         }
         foreach (var mod in capi.ModLoader.Mods)
-            Add(mod.Info.ModID, mod.Info.Version, mod.SourcePath, mod.SourceType.ToString(), "client");
+            Add(mod.Info.ModID, mod.Info.Version, mod.SourcePath, mod.SourceType.ToString(), "client", mod.Info.Name);
         try
         {
             var server = ServerInfo.Api;
             if (server != null)
                 foreach (var mod in server.ModLoader.Mods)
-                    Add(mod.Info.ModID, mod.Info.Version, mod.SourcePath, mod.SourceType.ToString(), "server");
+                    Add(mod.Info.ModID, mod.Info.Version, mod.SourcePath, mod.SourceType.ToString(), "server", mod.Info.Name);
         }
         catch { }
         foreach (var seen in LoadPhaseHook.SeenMods())
@@ -226,6 +227,7 @@ internal static class ContextCollector
             arr.Add(new JsonObject
             {
                 ["modid"] = m.ModId,
+                ["name"] = m.Name.Length == 0 ? null : m.Name,
                 ["version"] = m.Version,
                 ["enabled"] = true,
                 ["sides_loaded"] = new JsonArray(m.Sides.OrderBy(x => x, StringComparer.Ordinal).Select(x => (JsonNode?)JsonValue.Create(x)).ToArray()),
@@ -301,6 +303,159 @@ internal static class ContextCollector
         }
         catch { }
         return result;
+    }
+
+    static readonly string[] GcAppContextKeys =
+    {
+        "GCHeapHardLimit", "GCHeapHardLimitPercent", "System.GC.HeapHardLimit", "System.GC.HeapHardLimitPercent",
+        "System.GC.Server", "System.GC.Concurrent", "System.GC.RetainVM", "System.GC.ConserveMemory", "GCgen0size",
+    };
+
+    static readonly string[] GcEnvPrefixes = { "DOTNET_GC", "COMPlus_GC" };   // compared case-insensitively, so DOTNET_gc* is covered
+    static readonly string[] RuntimeEnvNames = { "DOTNET_gcServer", "DOTNET_TieredCompilation", "DOTNET_TieredPGO", "DOTNET_ReadyToRun", "COMPlus_gcServer", "COMPlus_TieredCompilation", "COMPlus_TieredPGO", "COMPlus_ReadyToRun" };
+
+    /// <summary>Process runtime facts. No game API needed.</summary>
+    public static JsonObject Runtime() => new()
+    {
+        ["framework_description"] = RuntimeInformation.FrameworkDescription,
+        ["environment_version"] = Environment.Version.ToString(),
+        ["os"] = RuntimeInformation.OSDescription,
+        ["process_arch"] = RuntimeInformation.ProcessArchitecture.ToString(),
+        ["processor_count"] = Environment.ProcessorCount,
+    };
+
+    /// <summary>GC configuration as the runtime reports it, plus the settings and environment variables that can change it.</summary>
+    public static JsonObject Gc()
+    {
+        var node = new JsonObject();
+        void Field(string key, Func<JsonNode?> read)
+        {
+            try { node[key] = read(); }
+            catch (Exception ex) { node[key] = null; node[key + "_error"] = ex.GetType().Name + ": " + ex.Message; }
+        }
+        Field("is_server_gc", () => global::System.Runtime.GCSettings.IsServerGC);
+        Field("latency_mode", () => global::System.Runtime.GCSettings.LatencyMode.ToString());
+        Field("lohcompaction_mode", () => global::System.Runtime.GCSettings.LargeObjectHeapCompactionMode.ToString());
+        Field("concurrent", () => AppContext.GetData("System.GC.Concurrent")?.ToString());
+        Field("total_available_memory_bytes", () => GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
+        Field("high_memory_load_threshold_bytes", () => GC.GetGCMemoryInfo().HighMemoryLoadThresholdBytes);
+        var ctx = new JsonObject();
+        foreach (var key in GcAppContextKeys)
+        {
+            try { ctx[key] = AppContext.GetData(key)?.ToString(); }
+            catch (Exception ex) { ctx[key] = "error: " + ex.Message; }
+        }
+        node["appcontext"] = ctx;
+        var env = new JsonObject();
+        try
+        {
+            foreach (System.Collections.DictionaryEntry kv in Environment.GetEnvironmentVariables())
+            {
+                string name = (string)kv.Key;
+                if (GcEnvPrefixes.Any(p => name.StartsWith(p, StringComparison.OrdinalIgnoreCase)) || RuntimeEnvNames.Contains(name, StringComparer.OrdinalIgnoreCase))
+                    env[name] = kv.Value?.ToString();
+            }
+        }
+        catch (Exception ex) { node["env_error"] = ex.Message; }
+        node["env"] = env;
+        return node;
+    }
+
+    public static JsonObject GameVersionNode() => new()
+    {
+        ["long"] = GameVersion.LongGameVersion,
+        ["short"] = GameVersion.ShortGameVersion,
+        ["overall"] = GameVersion.OverallVersion,
+    };
+
+    /// <summary>
+    /// PerfLog files (perf-*.jsonl, perfattrib-*.jsonl in DataPath\PerfLog) that overlap a capture: written during the window, or among the
+    /// newest of their kind when the capture started (a running game keeps appending to the file it opened earlier).
+    /// </summary>
+    public static JsonObject PerfFiles(DateTime windowStart, IReadOnlyCollection<string> newestAtStart)
+    {
+        string dir = Path.Combine(GamePaths.DataPath, "PerfLog");
+        var node = new JsonObject { ["folder"] = dir };
+        var files = new JsonArray();
+        if (!Directory.Exists(dir))
+        {
+            node["files"] = files;
+            node["note"] = "PerfLog folder does not exist";
+            return node;
+        }
+        var all = new DirectoryInfo(dir).EnumerateFiles("perf*-*.jsonl").Where(f => f.Name.StartsWith("perf-", StringComparison.OrdinalIgnoreCase) || f.Name.StartsWith("perfattrib-", StringComparison.OrdinalIgnoreCase));
+        foreach (var f in all.OrderBy(f => f.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            bool inWindow = f.LastWriteTime >= windowStart.AddSeconds(-2);   // anything modified since the capture began (the capture ends about now)
+            bool newest = newestAtStart.Contains(f.Name, StringComparer.OrdinalIgnoreCase);
+            if (!inWindow && !newest) continue;
+            files.Add(new JsonObject
+            {
+                ["name"] = f.Name,
+                ["bytes"] = f.Length,
+                ["mtime_local"] = Iso(f.LastWriteTime),
+                ["reason"] = inWindow ? "modified during or after the capture window start" : "newest of its kind when the capture started",
+            });
+        }
+        node["files"] = files;
+        return node;
+    }
+
+    /// <summary>Names of the newest few perf and perfattrib files right now, taken at capture start.</summary>
+    public static List<string> NewestPerfFileNames(int perKind = 2)
+    {
+        var names = new List<string>();
+        try
+        {
+            string dir = Path.Combine(GamePaths.DataPath, "PerfLog");
+            if (!Directory.Exists(dir)) return names;
+            foreach (var prefix in new[] { "perf-", "perfattrib-" })
+                names.AddRange(new DirectoryInfo(dir).EnumerateFiles(prefix + "*.jsonl").OrderByDescending(f => f.LastWriteTimeUtc).Take(perKind).Select(f => f.Name));
+        }
+        catch { }
+        return names;
+    }
+
+    /// <summary>Mod list read from a server API only (dedicated server). Same entry shape as ModList.</summary>
+    public static List<ModEntry> ServerModList(ICoreServerAPI sapi)
+    {
+        var byId = new Dictionary<string, ModEntry>(StringComparer.OrdinalIgnoreCase);
+        foreach (var mod in sapi.ModLoader.Mods)
+        {
+            if (string.IsNullOrEmpty(mod.Info.ModID)) continue;
+            var e = new ModEntry { ModId = mod.Info.ModID, Name = mod.Info.Name ?? "", Version = mod.Info.Version ?? "", SourcePath = mod.SourcePath ?? "", SourceType = mod.SourceType.ToString() };
+            e.Sides.Add("server");
+            byId[mod.Info.ModID] = e;
+        }
+        return byId.Values.OrderBy(m => m.ModId, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    /// <summary>Server side world facts for a server bundle. Main (server tick) thread.</summary>
+    public static JsonObject ServerWorld(ICoreServerAPI sapi)
+    {
+        var node = new JsonObject();
+        try { node["name"] = Path.GetFileNameWithoutExtension(sapi.WorldManager.CurrentWorldFilepath); } catch (Exception ex) { node["name"] = null; node["name_error"] = ex.Message; }
+        try { node["seed"] = sapi.World.Seed; } catch { node["seed"] = null; }
+        try { node["savegame_identifier"] = sapi.World.SavegameIdentifier; } catch { node["savegame_identifier"] = null; }
+        try
+        {
+            var config = new JsonObject();
+            foreach (var key in WorldConfigKeys) config[key] = sapi.World.Config?.GetAsString(key, null!);
+            node["worldconfig_headline"] = config;
+        }
+        catch { node["worldconfig_headline"] = null; }
+        return node;
+    }
+
+    /// <summary>Server counts and online players at one moment. Counts only, approximate by nature.</summary>
+    public static JsonObject ServerState(ICoreServerAPI sapi, BundleClock clock)
+    {
+        double t = clock.MsSince(Stopwatch.GetTimestamp());
+        var node = new JsonObject { ["ts_local"] = clock.IsoAt(t), ["t_ms"] = Math.Round(t, 1) };
+        try { node["loaded_chunks_server"] = sapi.WorldManager.AllLoadedChunks.Count; } catch { node["loaded_chunks_server"] = null; }
+        try { node["loaded_entities_server"] = sapi.World.LoadedEntities.Count; } catch { node["loaded_entities_server"] = null; }
+        try { node["online_players"] = sapi.World.AllOnlinePlayers.Length; } catch { node["online_players"] = null; }
+        return node;
     }
 
     public static string Iso(DateTime t) => BundleClock.Iso(t);

@@ -14,6 +14,8 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Remove="KnownAnswerTarget\**;spike\**;bin\**;obj\**" />
+    <Compile Include="..\..\src\Core\Model.cs" Link="Core\Model.cs" />
+    <Compile Include="..\..\src\Core\Attribution.cs" Link="Core\Attribution.cs" />
     <Compile Include="..\..\src\Core\HeapSnapshot.cs" Link="Core\HeapSnapshot.cs" />
     <Compile Include="..\..\src\Core\HeapDumpEventPipe.cs" Link="Core\HeapDumpEventPipe.cs" />
     <Compile Include="..\..\src\Core\MemoryReport.cs" Link="Core\MemoryReport.cs" />

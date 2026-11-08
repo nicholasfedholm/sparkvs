@@ -16,12 +16,12 @@ using Vintagestory.API.Server;
 
 namespace SparkVS;
 
-public sealed class SparkVSSystem : ModSystem, IRenderer
+public sealed partial class SparkVSSystem : ModSystem, IRenderer
 {
-    const int HardMaxSeconds = 300;
+    const int HardMaxSeconds = SparkVSConfig.HardMaxSeconds;   // absolute safety cap; MaxDurationSec in SparkVS.json is the configurable cap below it
     const int BaselineSeconds = 3;
     const int SpikeCapacity = 8192;
-    const int FrameRingCapacity = 1 << 20;   // about 3500 fps for 300 s; 13 MB, allocated once
+    // The frame ring is sized per capture by SparkVSConfig.FrameRingCapacityFor (3500 fps assumption, 13 bytes per entry, 109 MB at the cap).
     const int TickRingCapacity = 1 << 18;
     const string EtwEnv = "SPARKVS_ETW";
     const string AutostartEnv = "SPARKVS_AUTOSTART";    // label;delaySec;durationSec[;report]
@@ -34,8 +34,12 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
     static volatile int serverThreadId;
 
     ICoreClientAPI? capi;
-    SparkVSConfig config = new();
+    ICoreServerAPI? sapi;   // set on the server side instance only
+    SparkVSConfig config = SparkVSConfig.CreateDefault();
     long serverListener;
+    CaptureExtras? extras;            // entity census, chunk events, teleports (bundle captures)
+    List<string> perfNewestAtStart = new();
+    ILogger? Log => capi?.Logger ?? sapi?.Logger;
 
     // Everything below is touched by OnRenderFrame every frame of a capture, and allocates nothing there.
     volatile State state = State.Idle;
@@ -106,6 +110,9 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
     public override void StartServerSide(ICoreServerAPI api)
     {
         ServerInfo.Api = api;
+        sapi = api;
+        config = LoadConfig(api);
+        RegisterServerCapture(api);
         if (LoadPhaseHook.FlagInConfigFile("ChunkPipeline")) ChunkPipelineHooks.Install("server", api.Logger);
         serverListener = api.Event.RegisterGameTickListener(_ =>
         {
@@ -192,10 +199,28 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
         catch (Exception ex) { api.Logger.Warning("SparkVS: config unreadable, using defaults: " + ex.Message); }
         if (loaded == null)
         {
-            loaded = new SparkVSConfig();
+            // Null with a file on disk means the file could not be read (or LoadModConfig swallowed the parse error). Keep it before writing defaults over it.
+            try
+            {
+                string path = Path.Combine(GamePaths.ModConfig, file);
+                if (File.Exists(path))
+                {
+                    string bad = SparkVSConfig.BadFileName(path, DateTime.Now);
+                    File.Copy(path, bad, false);
+                    api.Logger.Warning("SparkVS: unreadable " + file + " kept as " + Path.GetFileName(bad) + ", writing defaults");
+                }
+            }
+            catch (Exception ex) { api.Logger.Warning("SparkVS: could not back up the unreadable config: " + ex.Message); }
+            loaded = SparkVSConfig.CreateDefault();
             api.StoreModConfig(loaded, file);
         }
+        else if (loaded.Migrate(out string migration))
+        {
+            api.StoreModConfig(loaded, file);
+            api.Logger.Notification("SparkVS: " + migration);
+        }
         loaded.MaxDurationSec = Math.Clamp(loaded.MaxDurationSec, 1, HardMaxSeconds);
+        loaded.DefaultDurationSec = Math.Max(1, loaded.DefaultDurationSec);
         loaded.MemoryTopN = Math.Clamp(loaded.MemoryTopN, 1, 200);
         return loaded;
     }
@@ -273,7 +298,12 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
         Directory.CreateDirectory(captureDir);
         mainThreadId = Os.CurrentThreadId();
 
-        if (bundle) frames = bundleFrames ??= new FrameLog(SpikeCapacity, config.SpikeThresholdMs, FrameRingCapacity);
+        if (bundle)
+        {
+            int ring = SparkVSConfig.FrameRingCapacityFor(durationSeconds);
+            if (bundleFrames == null || bundleFrames.RingCapacity < ring) bundleFrames = new FrameLog(SpikeCapacity, config.SpikeThresholdMs, ring);
+            frames = bundleFrames;
+        }
         else frames = new FrameLog(SpikeCapacity, config.SpikeThresholdMs);
         phaseStartStamp = Stopwatch.GetTimestamp();
         frames.Reset(phaseStartStamp);
@@ -346,7 +376,7 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
         catch (Exception ex)
         {
             bundleErrors.Add(what + ": " + ex.GetType().Name + ": " + ex.Message);
-            capi?.Logger.Warning("SparkVS bundle: " + what + " failed: " + ex.Message);
+            Log?.Warning("SparkVS bundle: " + what + " failed: " + ex.Message);
         }
     }
 
@@ -366,6 +396,14 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
         Guard("versions", () => ctxVersions = ContextCollector.Versions(api, BuildInfo.SparkVsVersion));
         Guard("mod list", () => ctxMods = ContextCollector.ModList(api));
         Guard("disabled mods", () => ctxDisabled = ContextCollector.DisabledModIds());
+        perfNewestAtStart = ContextCollector.NewestPerfFileNames();
+        // Census at start, chunk event subscription and the 1 Hz events sampler (teleports, gen2 GCs). Chunk handlers exist only until EndBundleState.
+        var ex = extras = new CaptureExtras(c, api, ServerInfo.Api, m => Log?.Warning("SparkVS bundle: " + m), config.EntityTickTiming);
+        Guard("events and census", () =>
+        {
+            ex.Begin(durationSeconds, label, "client");
+            ex.Events.ToolAt(ex.Events.Clock.MsSince(Stopwatch.GetTimestamp()), "hooks_present", ("chunk_pipeline_hooks_installed", ChunkPipelineHooks.Entries.Count(e => e.Info.Installed)), ("note", "Harmony hooks are installed at game start, not by the capture"));
+        });
 
         var heapRecorder = heap = new HeapRecorder(c);
         var hs = heapSampler = new PeriodicSampler("SparkVS heap 1Hz", c, heapRecorder.Sample);
@@ -469,6 +507,7 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
         if (gpuEndStamp == 0) gpuEndStamp = Stopwatch.GetTimestamp();
         EndChunkTimers();
         if (clock != null && capi != null) Guard("end state", () => endState = ContextCollector.State(capi, clock));
+        Guard("census end", () => extras?.EndWindow());
     }
 
     void StopBundleSamplers()
@@ -478,6 +517,7 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
         Guard("queue sampler stop", () => queueSampler?.Stop());
         Guard("heap sampler stop", () => heapSampler?.Stop());
         Guard("gpu sampler stop", () => gpuSampler?.Stop());
+        Guard("events sampler stop", () => extras?.StopSampler());
     }
 
     TextCommandResult OnStop()
@@ -636,15 +676,22 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
                 Guard("memory", () =>
                 {
                     memoryRunning = true;
+                    // Tool-induced event: the heap snapshot forces a full blocking GC, so events around it are the tool's doing.
+                    extras?.Events.Tool("heap_snapshot_begin", ("note", "forces a full blocking GC and pauses the game"));
                     try
                     {
                         var snap = HeapDumpEventPipe.Capture(Environment.ProcessId, TimeSpan.FromSeconds(120), m => capi?.Logger.Debug("SparkVS memory: " + m));
+                        extras?.Events.Tool("heap_snapshot_end", ("gc_pause_ms", Math.Round(snap.GcPauseMs, 1)), ("complete", snap.Complete));
                         var table = MemoryReport.Build(snap, memoryResolver, null, GrossNote);
                         MemoryReport.WriteCsvOnly(dir, table);
                     }
                     finally { memoryRunning = false; }
                 });
-            File.WriteAllText(Path.Combine(dir, ReportBuilder.MetaFile), JsonSerializer.Serialize(meta));
+            if (bundleMode && extras != null) Guard("events", () => extras.Events.Write(Path.Combine(dir, ExtraSections.EventsFile)));
+            var metaNode = JsonSerializer.SerializeToNode(meta)!.AsObject();
+            metaNode["mode"] = bundleMode ? "client-bundle" : "client";
+            if (bundleMode && extras != null) metaNode[ExtraSections.OverheadKey] = extras.OverheadNode();
+            File.WriteAllText(Path.Combine(dir, ReportBuilder.MetaFile), metaNode.ToJsonString());
             lastCaptureDir = dir;
             message = session.ReaderError != null
                 ? "SparkVS: trace stream failed: " + session.ReaderError.Message
@@ -670,6 +717,8 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
         Guard("heap", () => summary.Heap = heap!.Write(dir, heapSampler?.LastError));
         Guard("gpu memory", () => summary.Vram = gpu!.Write(dir));
         Guard("stubs", () => BundleWriter.WriteStubs(dir));
+        Guard("census files", () => extras?.WriteCensusFiles(dir));
+        Guard("entity ticks", () => extras?.WriteEntityTicks(dir));
         Guard("gpu phases", () => BundleWriter.WriteJson(Path.Combine(dir, "gpu-phases.json"), BuildGpuPhases()));
         Guard("allocations placeholder", () => BundleWriter.WriteJson(Path.Combine(dir, "allocations.json"), AllocationReport.Disabled("pending: allocations.json is built by the report step; run .sparkvs report")));
         Guard("chunk pipeline", () => BundleWriter.WriteJson(Path.Combine(dir, "chunk-pipeline.json"), !config.ChunkPipeline
@@ -725,9 +774,30 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
             ["disabled_note"] = "disabled ids come from clientsettings.json on disk; every entry in entries is a loaded mod",
         };
         ctx["mods"] = mods;
+        AddCommonContext(ctx, c.StartLocal);
         ctx["load_phases"] = LoadPhaseHook.Log.ToJson(ctxMods?.Select(m => m.ModId).ToList() ?? new List<string>());
         ctx["collection_errors"] = new JsonArray(bundleErrors.Select(e => (JsonNode?)JsonValue.Create(e)).ToArray());
         BundleWriter.WriteJson(Path.Combine(dir, "context.json"), ctx);
+    }
+
+    /// <summary>Context keys that do not depend on which side captured. Each is null with a reason on failure.</summary>
+    void AddCommonContext(JsonObject ctx, DateTime windowStart)
+    {
+        void Put(string key, Func<JsonNode?> make)
+        {
+            try { ctx[key] = make(); }
+            catch (Exception ex)
+            {
+                ctx[key] = null;
+                ctx[key + "_reason"] = ex.GetType().Name + ": " + ex.Message;
+                bundleErrors.Add(key + ": " + ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+        Put("runtime", () => ContextCollector.Runtime());
+        Put("gc", () => ContextCollector.Gc());
+        Put("game_version", () => ContextCollector.GameVersionNode());
+        Put("sparkvs_config", () => JsonSerializer.SerializeToNode(config));
+        Put("perf_files", () => ContextCollector.PerfFiles(windowStart, perfNewestAtStart));
     }
 
     /// <summary>The bench runner passes the ETW profile it started (or "none") in SPARKVS_ETW through the plan env; a manual capture has no such variable.</summary>
@@ -852,6 +922,12 @@ public sealed class SparkVSSystem : ModSystem, IRenderer
 
     public override void Dispose()
     {
+        if (serverPhase == ServerPhase.Running)
+        {
+            // Server shutting down mid capture: keep what was captured and give the writer thread a few seconds.
+            FinishServerCapture();
+            for (int i = 0; i < 100 && serverPhase != ServerPhase.Idle; i++) Thread.Sleep(100);
+        }
         if (state == State.Capturing)
         {
             // Leaving the world mid capture: close the session so the runtime is not left sampling,

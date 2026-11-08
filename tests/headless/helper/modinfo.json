@@ -1,0 +1,11 @@
+{
+  "type": "code",
+  "name": "SparkVS Test Helper",
+  "modid": "sparkvstesthelper",
+  "version": "1.0.0",
+  "description": "Test only, not shipped. Spawns known entity counts and drives a SparkVS server capture.",
+  "side": "Server",
+  "requiredOnClient": false,
+  "requiredOnServer": true,
+  "dependencies": { "game": "" }
+}

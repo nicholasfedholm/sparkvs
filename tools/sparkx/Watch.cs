@@ -186,11 +186,16 @@ public static class Watch
     {
         public int Index;
         public double AtSeconds;
+        public string Label = "";
         public string Dir = "";
         public MemoryTable Table = new();
     }
 
-    public const string GrossNote = "estimated from sampled allocation ticks (about one per 100 KB), total over the whole watch; not live RAM";
+    public const double DefaultStartDelaySec = 60;
+    public const double DefaultStartMaxWaitSec = 600;
+    public const string TimelineHeader = "utc,elapsed_s,working_set_bytes,private_bytes,gc_heap_bytes,gross_alloc_bytes_total,marker\n";
+
+    public const string GrossNote ="estimated from sampled allocation ticks (about one per 100 KB), total over the whole watch; not live RAM";
 
     public static int Run(Args args)
     {
@@ -201,6 +206,9 @@ public static class Watch
         double everyMin = args.GetDouble("snapshot-every", 0);
         int top = Math.Clamp(args.GetInt("top", 20), 1, 200);
         string outDir = args.Get("out") ?? Path.Combine(Directory.GetCurrentDirectory(), "sparkx-watch-" + DateTime.Now.ToString("yyyyMMdd-HHmmss", inv));
+        double startDelay = Math.Max(0, args.GetDouble("start-delay", DefaultStartDelaySec));
+        double startMaxWait = Math.Max(startDelay, args.GetDouble("start-max-wait", DefaultStartMaxWaitSec));
+        int maxAttempts = Math.Clamp(args.GetInt("snapshot-attempts", SnapshotPolicy.DefaultAttempts), 1, 10);
         Directory.CreateDirectory(outDir);
 
         var resolver = ExternalModResolver.Create(pid, args.Get("data"));
@@ -219,40 +227,102 @@ public static class Watch
         int snapIndex = 0;
         var clock = Stopwatch.StartNew();
 
-        Snap TakeSnapshot(string label)
+        var timeline = new StringBuilder();
+        timeline.Append(TimelineHeader);
+        var timelineLock = new object();
+        string timelinePath = Path.Combine(outDir, "timeline.csv");
+        var heapSamples = new List<long>();
+        var wsSamples = new List<long>();
+        int watchEnded = 0;
+
+        // Marker rows carry the snapshot stamp in the trailing marker column; the numeric columns are empty.
+        void AddMarker(string text)
+        {
+            lock (timelineLock)
+            {
+                timeline.Append(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", inv)).Append(',')
+                    .Append(clock.Elapsed.TotalSeconds.ToString("0.0", inv)).Append(",,,,,").Append(text).Append('\n');
+                try { File.WriteAllText(timelinePath, timeline.ToString(), new UTF8Encoding(false)); } catch { }
+            }
+        }
+
+        Snap TakeSnapshot(string label, string startCondition = "")
         {
             int idx = Interlocked.Increment(ref snapIndex) - 1;
             double at = clock.Elapsed.TotalSeconds;
             Console.WriteLine("snapshot " + idx.ToString(inv) + " (" + label + ") at " + at.ToString("0", inv) + " s ...");
+            AddMarker("snapshot:" + label + " begin max_attempts=" + maxAttempts.ToString(inv));
             HeapSnapshot snap;
             // The runtime logs each type name once per Type-keyword epoch, so the alloc monitor session must not be
             // running while a dump session starts, or the dump would get no type names. Pause it, dump, restart it.
             lock (snapGate)
             {
                 monitor.Stop();
-                try { snap = HeapDumpEventPipe.Capture(pid, TimeSpan.FromMinutes(10)); }
+                try
+                {
+                    snap = HeapDumpEventPipe.Capture(pid, TimeSpan.FromMinutes(10), null, maxAttempts, a =>
+                    {
+                        Console.WriteLine("  attempt " + a.Attempt.ToString(inv) + ": " + a.Outcome + ", buffer " + a.BufferMB.ToString(inv) + " MB, events lost "
+                            + a.EventsLost.ToString(inv) + ", gc pause " + (a.GcPauseMs >= 0 ? a.GcPauseMs.ToString("0", inv) + " ms" : "n/a"));
+                        AddMarker("snapshot:" + label + " attempt=" + a.Attempt.ToString(inv) + " outcome=" + a.Outcome.Replace(' ', '-')
+                            + " events_lost=" + a.EventsLost.ToString(inv) + " gc_pause_ms=" + (a.GcPauseMs >= 0 ? a.GcPauseMs.ToString("0", inv) : "n/a"));
+                    });
+                }
                 finally
                 {
                     try { monitor.Start(pid); }
                     catch (Exception ex) { Console.Error.WriteLine("allocation monitor restart failed: " + ex.Message); }
                 }
             }
+            snap.StartCondition = startCondition;
+            AddMarker(SnapshotPolicy.Marker(label, snap));
             var table = MemoryReport.Build(snap, resolver, null, "");
-            var sn = new Snap { Index = idx, AtSeconds = at, Table = table, Dir = Path.Combine(outDir, "snapshot-" + idx.ToString("00", inv)) };
+            var sn = new Snap { Index = idx, AtSeconds = at, Label = label, Table = table, Dir = Path.Combine(outDir, "snapshot-" + idx.ToString("00", inv)) };
             lock (snapLock) snaps.Add(sn);
-            Console.WriteLine("snapshot " + idx.ToString(inv) + " done: pause " + snap.GcPauseMs.ToString("0", inv) + " ms, complete " + snap.Complete + ", events lost " + snap.EventsLost.ToString(inv));
+            Console.WriteLine("snapshot " + idx.ToString(inv) + " done: pause " + snap.GcPauseMs.ToString("0", inv) + " ms, complete " + snap.Complete + ", events lost " + snap.EventsLost.ToString(inv)
+                + ", attempts " + snap.Attempts.ToString(inv));
             return sn;
         }
 
-        // Snapshot at start runs in the background while the timeline sampling begins.
-        pending.Add(Task.Run(() => TakeSnapshot("start")));
+        // First snapshot: wait for the target to settle. At least startDelay seconds after attach AND GC heap bytes changed under 5 %
+        // across the last 3 timeline samples; give up after startMaxWait seconds and take it anyway, recorded as start_condition=timeout.
+        // If the watch ends first the snapshot is taken at once and also recorded as timeout.
+        Snap StartSnapshot()
+        {
+            string cond = "stable";
+            string basis = "gc_heap";
+            AddMarker("start-wait:begin delay_s=" + startDelay.ToString("0.##", inv) + " max_wait_s=" + startMaxWait.ToString("0.##", inv));
+            Console.WriteLine("first snapshot waits for at least " + startDelay.ToString("0.##", inv) + " s and a stable heap (gives up after " + startMaxWait.ToString("0.##", inv) + " s)");
+            while (true)
+            {
+                double el = clock.Elapsed.TotalSeconds;
+                if (Volatile.Read(ref watchEnded) != 0 || cts.IsCancellationRequested) { cond = "timeout"; basis = "watch ended"; break; }
+                if (el >= startMaxWait) { cond = "timeout"; basis = "max wait reached"; break; }
+                if (el >= startDelay)
+                {
+                    bool stable;
+                    lock (timelineLock)
+                    {
+                        if (heapSamples.Count > 0) { stable = SnapshotPolicy.HeapStable(heapSamples); basis = "gc_heap"; }
+                        else { stable = SnapshotPolicy.HeapStable(wsSamples); basis = "working_set (no GC heap data)"; }
+                    }
+                    if (stable) break;
+                }
+                cts.Token.WaitHandle.WaitOne(500);
+            }
+            AddMarker("start-wait:end start_condition=" + cond + " basis=" + basis.Replace(' ', '-'));
+            Console.WriteLine("first snapshot start_condition=" + cond + " (" + basis + ") at " + clock.Elapsed.TotalSeconds.ToString("0", inv) + " s");
+            var sn = TakeSnapshot("start", cond);
+            if (cond == "timeout") sn.Table.Snapshot.Warnings.Add("start_condition=timeout: the target was not observed stable (" + basis + "); the first snapshot may not be a quiet baseline");
+            return sn;
+        }
 
-        var timeline = new StringBuilder();
-        timeline.Append("utc,elapsed_s,working_set_bytes,private_bytes,gc_heap_bytes,gross_alloc_bytes_total\n");
+        // The first snapshot runs in the background while the timeline sampling begins.
+        pending.Add(Task.Run(StartSnapshot));
+
         double totalSec = minutes * 60.0;
         double nextSnapSec = everyMin > 0 ? everyMin * 60.0 : double.MaxValue;
         double nextSample = 0;
-        string timelinePath = Path.Combine(outDir, "timeline.csv");
         Console.WriteLine("watching pid " + pid.ToString(inv) + " for " + minutes.ToString("0.##", inv) + " min; Ctrl+C ends early and still writes the outputs");
 
         while (!cts.IsCancellationRequested)
@@ -265,13 +335,19 @@ public static class Watch
                 {
                     using var p = Process.GetProcessById(pid);
                     p.Refresh();
-                    timeline.Append(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", inv)).Append(',')
-                        .Append(el.ToString("0.0", inv)).Append(',')
-                        .Append(p.WorkingSet64.ToString(inv)).Append(',')
-                        .Append(p.PrivateMemorySize64.ToString(inv)).Append(',')
-                        .Append(monitor.LastHeapBytes >= 0 ? monitor.LastHeapBytes.ToString(inv) : "").Append(',')
-                        .Append(monitor.TotalGross.ToString(inv)).Append('\n');
-                    File.WriteAllText(timelinePath, timeline.ToString(), new UTF8Encoding(false));
+                    long heapNow = monitor.LastHeapBytes;
+                    lock (timelineLock)
+                    {
+                        if (heapNow > 0) heapSamples.Add(heapNow);
+                        wsSamples.Add(p.WorkingSet64);
+                        timeline.Append(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", inv)).Append(',')
+                            .Append(el.ToString("0.0", inv)).Append(',')
+                            .Append(p.WorkingSet64.ToString(inv)).Append(',')
+                            .Append(p.PrivateMemorySize64.ToString(inv)).Append(',')
+                            .Append(heapNow >= 0 ? heapNow.ToString(inv) : "").Append(',')
+                            .Append(monitor.TotalGross.ToString(inv)).Append(",\n");
+                        File.WriteAllText(timelinePath, timeline.ToString(), new UTF8Encoding(false));
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -289,12 +365,13 @@ public static class Watch
         }
 
         bool early = cts.IsCancellationRequested;
+        Volatile.Write(ref watchEnded, 1);
         try { Task.WaitAll(pending.ToArray()); } catch (AggregateException ex) { Console.Error.WriteLine("snapshot failed: " + ex.InnerException?.Message); }
 
         Snap? last = null;
         try { last = TakeSnapshot("end"); }
         catch (Exception ex) { Console.Error.WriteLine("end snapshot failed: " + ex.Message); }
-        File.WriteAllText(timelinePath, timeline.ToString(), new UTF8Encoding(false));
+        lock (timelineLock) File.WriteAllText(timelinePath, timeline.ToString(), new UTF8Encoding(false));
 
         monitor.Stop();
         Console.CancelKeyPress -= onCancel;
@@ -318,7 +395,8 @@ public static class Watch
         string report = BuildReport(ordered, gross, resolver, top, minutes, early, clock.Elapsed.TotalSeconds, pid, monitor);
         File.WriteAllText(Path.Combine(outDir, "report.md"), report, new UTF8Encoding(false));
         int rows = timeline.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries).Length - 1;
-        Console.WriteLine("timeline rows: " + rows.ToString(inv));
+        int markerRows = timeline.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries).Count(l => l.Contains(",snapshot:") || l.Contains(",start-wait:"));
+        Console.WriteLine("timeline rows: " + rows.ToString(inv) + " (marker rows: " + markerRows.ToString(inv) + ")");
         Console.WriteLine("wrote " + Path.GetFullPath(outDir) + "\\report.md, timeline.csv, snapshot-NN\\memory.*");
         return ordered.All(s => s.Table.Snapshot.Complete) ? 0 : 1;
     }
@@ -339,15 +417,22 @@ public static class Watch
         for (int i = 0; i < MemoryReport.HonestLimits.Length; i++)
             sb.Append((i + 1).ToString(inv)).Append(". ").Append(MemoryReport.HonestLimits[i]).Append('\n');
 
-        sb.Append("\n## Snapshots\n\n| # | at s | complete | events lost | dump GC pause ms | live MB | folder |\n|---:|---:|---|---:|---:|---:|---|\n");
+        bool anyPartial = snaps.Any(x => !x.Table.Snapshot.Complete);
+        if (anyPartial)
+            sb.Append("\n> PARTIAL: at least one snapshot is not complete (events lost, no dump GC end seen, or an error). Numbers marked PARTIAL come from such a snapshot and are lower bounds; a difference that involves one is not a measured change.\n");
+        sb.Append("\n## Snapshots\n\n| # | label | at s | complete | events lost | attempts | start condition | dump GC pause ms | live MB | folder |\n|---:|---|---:|---|---:|---:|---|---:|---:|---|\n");
         foreach (var s in snaps)
         {
             var sn = s.Table.Snapshot;
-            sb.Append("| ").Append(s.Index.ToString(inv)).Append(" | ").Append(s.AtSeconds.ToString("0", inv))
+            sb.Append("| ").Append(s.Index.ToString(inv)).Append(" | ").Append(s.Label).Append(" | ").Append(s.AtSeconds.ToString("0", inv))
                 .Append(" | ").Append(sn.Complete ? "yes" : "NO").Append(" | ").Append(sn.EventsLost.ToString(inv))
-                .Append(" | ").Append(sn.GcPauseMs.ToString("0", inv)).Append(" | ").Append(MemoryReport.Mb(s.Table.TotalLiveBytes).ToString("0.0", inv))
+                .Append(" | ").Append(sn.Attempts.ToString(inv)).Append(" | ").Append(sn.StartCondition.Length > 0 ? sn.StartCondition : "n/a")
+                .Append(" | ").Append(sn.GcPauseMs.ToString("0", inv)).Append(" | ").Append(MemoryReport.Mb(s.Table.TotalLiveBytes).ToString("0.0", inv)).Append(sn.Complete ? "" : " PARTIAL")
                 .Append(" | ").Append(Path.GetFileName(s.Dir)).Append(" |\n");
-            foreach (var w in sn.Warnings) sb.Append("|  |  |  |  |  |  | WARNING: ").Append(w.Replace("|", "/")).Append(" |\n");
+            foreach (var a in sn.AttemptLog)
+                sb.Append("|  |  |  |  |  |  |  |  |  | attempt ").Append(a.Attempt.ToString(inv)).Append(": ").Append(a.Outcome).Append(", buffer ").Append(a.BufferMB.ToString(inv))
+                    .Append(" MB, events lost ").Append(a.EventsLost.ToString(inv)).Append(", gc pause ").Append(a.GcPauseMs >= 0 ? a.GcPauseMs.ToString("0", inv) + " ms" : "n/a").Append(" |\n");
+            foreach (var w in sn.Warnings) sb.Append("|  |  |  |  |  |  |  |  |  | WARNING: ").Append(w.Replace("|", "/")).Append(" |\n");
         }
 
         if (snaps.Count >= 1)
@@ -370,15 +455,33 @@ public static class Watch
             sb.Append("\n## Live MB per owner, start vs end (snapshot ").Append(snaps[0].Index.ToString(inv)).Append(" to ")
                 .Append(snaps[snaps.Count - 1].Index.ToString(inv)).Append(")\n\n");
             sb.Append("| owner | kind | start MB | end MB | delta MB | gross alloc MB (estimated, whole watch) |\n|---|---|---:|---:|---:|---:|\n");
+            bool sp = !first.Snapshot.Complete, ep = !lastT.Snapshot.Complete;
+            if (sp || ep)
+                sb.Append("PARTIAL (lower bound): ").Append(sp && ep ? "both the start and the end snapshot are" : sp ? "the start snapshot is" : "the end snapshot is")
+                    .Append(" not complete, so the marked numbers are lower bounds and every delta here is PARTIAL.\n\n");
+            sb.Append("| owner | kind | start MB | end MB | delta MB | gross alloc MB (estimated, whole watch) |\n|---|---|---:|---:|---:|---:|\n");
             int mods = 0;
             foreach (var r in rows)
             {
                 if (r.Kind == OwnerKind.Mod) { if (mods >= top) continue; mods++; }
                 sb.Append("| ").Append(r.Id.Replace("|", "/")).Append(" | ").Append(r.Kind.ToString().ToLowerInvariant())
-                    .Append(" | ").Append(MemoryReport.Mb(r.Start).ToString("0.00", inv))
-                    .Append(" | ").Append(MemoryReport.Mb(r.End).ToString("0.00", inv))
-                    .Append(" | ").Append(MemoryReport.Mb(r.End - r.Start).ToString("+0.00;-0.00;0.00", inv))
+                    .Append(" | ").Append(MemoryReport.Mb(r.Start).ToString("0.00", inv)).Append(sp ? " PARTIAL" : "")
+                    .Append(" | ").Append(MemoryReport.Mb(r.End).ToString("0.00", inv)).Append(ep ? " PARTIAL" : "")
+                    .Append(" | ").Append(MemoryReport.Mb(r.End - r.Start).ToString("+0.00;-0.00;0.00", inv)).Append(sp || ep ? " PARTIAL" : "")
                     .Append(" | ").Append(r.Gross.HasValue ? MemoryReport.Mb(r.Gross.Value).ToString("0.00", inv) : "n/a").Append(" |\n");
+            }
+
+            sb.Append("\n## Live MB by assembly, end snapshot (top 15; full list in snapshot-NN\\memory.json)").Append(ep ? " PARTIAL" : "").Append("\n\n");
+            sb.Append("| bucket | owner kind | owner | live MB | live objects |\n|---|---|---|---:|---:|\n");
+            foreach (var a in lastT.ByAssembly.Take(15))
+                sb.Append("| ").Append(a.Bucket.Replace("|", "/")).Append(" | ").Append(a.Kind.ToString().ToLowerInvariant()).Append(" | ").Append(a.OwnerId.Replace("|", "/"))
+                    .Append(" | ").Append(MemoryReport.Mb(a.Bytes).ToString("0.00", inv)).Append(ep ? " PARTIAL" : "").Append(" | ").Append(a.Count.ToString("N0", inv)).Append(" |\n");
+            var unk = lastT.Rows.FirstOrDefault(x => x.Kind == OwnerKind.Unknown);
+            if (unk != null)
+            {
+                sb.Append("\nUnknown at the end: ").Append(MemoryReport.Mb(unk.LiveBytes).ToString("0.00", inv)).Append(" MB").Append(ep ? " PARTIAL" : "")
+                    .Append(". Reasons: ").Append(lastT.UnknownReasons.Count == 0 ? "none" : string.Join("; ", lastT.UnknownReasons.Select(u => u.Reason + " " + MemoryReport.Mb(u.Bytes).ToString("0.00", inv) + " MB")))
+                    .Append(". Top 10 unknown types are in the end snapshot's memory.md.\n");
             }
         }
         return sb.ToString();

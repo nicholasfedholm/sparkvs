@@ -99,3 +99,12 @@ Notes
 This is a profiling tool, not a performance mod. It does not make the game faster, it tells you what is making it slow. Run a capture while the problem is actually happening, an idle capture of a healthy game mostly proves the game was idle.
 
 Not part of MoonshotCore. SparkVS is its own standalone mod.
+
+Capture-gap fixes (folded into 0.3.0)
+
+- Server capture: /sparkvs capture [seconds] [label] also works on a dedicated server with no client. It writes a folder ending in -server under the bundle folder.
+- New bundle files: census-start.json and census-end.json (entity census), events.jsonl (chunk and world events), context.json (enriched game, mod and runtime context), entity-ticks.json (per-entity tick timing by entity code, toggled by the EntityTickTiming setting).
+- Durations: DefaultDurationSec is now 600 and MaxDurationSec is 1800 (older config defaults of 120 and 300 are migrated).
+- Memory snapshots are grouped into assembly buckets, and sparkx snapshot reliability was improved.
+- sparkx: see tools/sparkx/README.md for the current flags.
+- tests/headless holds the headless server capture test (run_capture_test.py, verify_bundle.py and a small helper mod). Set the game install path in run_capture_test.py before use.

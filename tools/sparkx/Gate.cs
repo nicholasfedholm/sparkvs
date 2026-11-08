@@ -117,7 +117,7 @@ public static class Gate
             long attributed = table.Rows.Where(r => r.Id == "known-answer").Select(r => r.LiveBytes).FirstOrDefault();
             double err = expected > 0 ? 100.0 * (attributed - expected) / expected : double.NaN;
 
-            bool accuracy = snap.Complete && Math.Abs(err) <= 20.0;
+            bool accuracy = snap.Complete && snap.EventsLost == 0 && Math.Abs(err) <= 20.0;
             bool freeze = snap.GcPauseMs <= 5000 && stall >= 0 && stall <= 5000;
             bool pass = accuracy && freeze;
 
@@ -131,7 +131,8 @@ public static class Gate
             Console.WriteLine("dump GC pause ms: " + snap.GcPauseMs.ToString("0.0", inv));
             Console.WriteLine("target max stall: " + stall.ToString("0.0", inv) + " ms (limit 5000 ms with pause: " + (freeze ? "ok" : "FAIL") + ")");
             Console.WriteLine("events lost:      " + snap.EventsLost.ToString(inv));
-            Console.WriteLine("complete:         " + snap.Complete + ", snapshot took " + snap.ElapsedMs.ToString("0", inv) + " ms");
+            Console.WriteLine("complete:         " + snap.Complete + ", attempts " + snap.Attempts.ToString(inv) + ", start_condition " + (snap.StartCondition.Length > 0 ? snap.StartCondition : "n/a") + ", snapshot took " + snap.ElapsedMs.ToString("0", inv) + " ms");
+            foreach (var a in snap.AttemptLog) Console.WriteLine("attempt " + a.Attempt.ToString(inv) + ":        " + a.Outcome + ", buffer " + a.BufferMB.ToString(inv) + " MB, events lost " + a.EventsLost.ToString(inv) + ", gc pause " + (a.GcPauseMs >= 0 ? a.GcPauseMs.ToString("0.0", inv) + " ms" : "n/a"));
             foreach (var w in snap.Warnings) Console.WriteLine("warning:          " + w);
             Console.WriteLine(pass ? "GATE PASS" : "GATE FAIL");
             return pass ? 0 : 1;

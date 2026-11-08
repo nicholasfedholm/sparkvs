@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using SparkVS;
 using SparkVS.Core;
 
 int passed = 0, failed = 0;
@@ -841,6 +842,183 @@ Check("frame log self count zero", zero.AllocatedBytes == 0, zero.AllocatedBytes
     GC.KeepAlive(kNodes);
     GC.KeepAlive(kCells);
 }
+
+MemoryEngineTests.Run(Check);
+
+// ===== BEGIN capture-fixes worker A tests: entity census, events log, config migration, durations =====
+{
+    // Census: counts, domain rollup, densest chunk
+    var ents = new List<(string, double, double, double)>
+    {
+        ("game:wolf-male", 1, 100, 1), ("game:wolf-male", 5, 100, 5), ("game:wolf-male", 40, 100, 40),
+        ("lop:trex", -1, 50, -1), ("lop:trex", -2, 50, -3), ("lop:trex", -3, 51, -3),
+        ("bare", 0, 0, 0),
+    };
+    var cen = EntityCensus.Build(ents, "server");
+    Check("census total", cen.Total == 7, cen.Total.ToString());
+    Check("census by_code order", cen.ByCode[0].Key == "game:wolf-male" && cen.ByCode[0].Value == 3 && cen.ByCode[1].Key == "lop:trex" && cen.ByCode[2].Key == "bare", string.Join(",", cen.ByCode.Select(k => k.Key + "=" + k.Value)));
+    Check("census domain rollup", cen.ByDomain.Count == 2 && cen.ByDomain[0].Key == "game" && cen.ByDomain[0].Value == 4 && cen.ByDomain[1].Key == "lop" && cen.ByDomain[1].Value == 3, string.Join(",", cen.ByDomain.Select(k => k.Key + "=" + k.Value)));
+    Check("census domain none is game", EntityCensus.DomainOf("bare") == "game" && EntityCensus.DomainOf("lop:trex") == "lop");
+    Check("census densest chunk (negative coords floor)", cen.Densest != null && cen.Densest.Cx == -1 && cen.Densest.Cy == 1 && cen.Densest.Cz == -1 && cen.Densest.Count == 3, cen.Densest == null ? "null" : $"{cen.Densest.Cx},{cen.Densest.Cy},{cen.Densest.Cz} n={cen.Densest.Count}");
+    Check("census densest block coords", cen.Densest!.BlockX == -32 && cen.Densest.BlockZ == -32);
+    Check("census densest top codes", cen.Densest.TopCodes.Count == 1 && cen.Densest.TopCodes[0].Key == "lop:trex" && cen.Densest.TopCodes[0].Value == 3);
+    Check("census empty input", EntityCensus.Build(new List<(string, double, double, double)>(), "client").Densest == null);
+    var tops = EntityCensus.Build(Enumerable.Range(0, 20).Select(i => ($"game:e{i:00}", 1.0, 1.0, 1.0)), "server");
+    Check("census top_codes capped at 5", tops.Densest!.TopCodes.Count == 5 && tops.Densest.Count == 20);
+    cen.Source = "test"; cen.TMs = 12.34; cen.DurationMs = 1.5; cen.TsLocal = "2026-11-08T00:00:00.000+00:00";
+    var cenJson = cen.ToJson(2);
+    var back = EntityCensus.FromJson(JsonNode.Parse(cenJson.ToJsonString()));
+    Check("census json round trip", back != null && back.Total == 7 && back.ByCode.Count == 3 && back.Densest!.Count == 3 && back.Side == "server" && back.DurationMs == 1.5);
+    Check("census json keys", cenJson["by_code"] != null && cenJson["by_domain"] != null && cenJson["densest_chunk"]?["top_codes"] != null && cenJson["duration_ms"] != null && cenJson["side"]?.GetValue<string>() == "server");
+    Check("census disabled placeholder reads as null", EntityCensus.FromJson(EntityCensus.Disabled(2, "x")) == null);
+
+    // Diff
+    var endEnts = new List<(string, double, double, double)>
+    {
+        ("game:wolf-male", 1, 100, 1), ("game:wolf-male", 5, 100, 5),
+        ("lop:trex", -1, 50, -1), ("lop:trex", -2, 50, -3), ("lop:trex", -3, 51, -3),
+        ("lop:raptor", 0, 0, 0), ("lop:raptor", 1, 0, 1),
+    };
+    var diff = EntityCensus.Diff(cen, EntityCensus.Build(endEnts, "server"));
+    Check("diff total delta", diff.TotalDelta == 0 && diff.StartTotal == 7 && diff.EndTotal == 7);
+    Check("diff code order by abs delta", diff.ByCode.Count == 3 && diff.ByCode[0].Key == "lop:raptor" && diff.ByCode[0].Delta == 2 && diff.ByCode[1].Delta == -1, string.Join(",", diff.ByCode.Select(d => d.Key + ":" + d.Delta)));
+    Check("diff appeared and vanished", diff.Appeared.SequenceEqual(new[] { "lop:raptor" }) && diff.Vanished.SequenceEqual(new[] { "bare" }), string.Join("|", diff.Appeared) + "/" + string.Join("|", diff.Vanished));
+    Check("diff domain deltas", diff.ByDomain.Count == 2 && diff.ByDomain[0].Key == "game" && diff.ByDomain[0].Delta == -2 && diff.ByDomain[1].Key == "lop" && diff.ByDomain[1].Delta == 2, string.Join(",", diff.ByDomain.Select(d => d.Key + ":" + d.Delta)));
+    Check("diff markdown names changes", diff.Markdown(10).Contains("lop:raptor") && diff.ToJson(10)["top_code_changes"]!.AsArray().Count == 3);
+    var same = EntityCensus.Diff(cen, cen);
+    Check("diff of identical censuses is empty", same.ByCode.Count == 0 && same.TotalDelta == 0 && same.Appeared.Count == 0);
+
+    // Events: bucketing and flush
+    var evClock = new BundleClock(0, new DateTime(2026, 11, 8, 12, 0, 0), Stopwatch.Frequency);
+    var ev = new EventLog(evClock);
+    for (int i = 0; i < 3; i++) ev.ChunkLoaded();
+    ev.ChunkUnloaded();
+    ev.ClientChunkReceived(); ev.ClientChunkReceived();
+    ev.Ignored();
+    Check("events flush writes a row for a non-empty second", ev.Flush(1000) && ev.RowCount == 1);
+    Check("events flush skips an empty second", !ev.Flush(2000) && ev.RowCount == 1);
+    var chunkRow = JsonNode.Parse(ev.Lines()[0])!.AsObject();
+    Check("events chunk row shape", chunkRow["type"]!.GetValue<string>() == "chunks" && chunkRow["source"]!.GetValue<string>() == "game" && chunkRow["loaded"]!.GetValue<int>() == 3 && chunkRow["unloaded"]!.GetValue<int>() == 1 && chunkRow["client_received"]!.GetValue<int>() == 2 && chunkRow["t_ms"]!.GetValue<double>() == 1000 && chunkRow["ts_local"]!.GetValue<string>().StartsWith("2026-11-08T12:00:01"));
+    Check("events handler overhead counted", ev.HandlerCalls == 7 && ev.HandlerNs >= 0, ev.HandlerCalls.ToString());
+    ev.ChunkLoaded();
+    Check("events flush resets the bucket", ev.Flush(3000) && JsonNode.Parse(ev.Lines()[1])!["loaded"]!.GetValue<int>() == 1 && JsonNode.Parse(ev.Lines()[1])!["unloaded"]!.GetValue<int>() == 0);
+    ev.ToolAt(500, "capture_start", ("mode", "server"));
+    ev.ToolAt(2500, "census_end", ("duration_ms", 1.25), ("entity_total", 42L));
+    ev.Gc(2800, 1, 3);
+    ev.Teleport(2900, new TeleportInfo { Player = "Nick", FromX = 0, FromY = 80, FromZ = 0, ToX = 500, ToY = 80, ToZ = 0, Distance = 500 });
+    var lines = ev.Lines();
+    var t0s = lines.Select(l => JsonNode.Parse(l)!["t_ms"]!.GetValue<double>()).ToList();
+    Check("events lines sorted by t_ms", t0s.SequenceEqual(t0s.OrderBy(x => x)), string.Join(",", t0s));
+    var gcRow = lines.Select(l => JsonNode.Parse(l)!.AsObject()).First(o => o["type"]!.GetValue<string>() == "gc");
+    Check("events gc row", gcRow["source"]!.GetValue<string>() == "runtime" && gcRow["gen2_count_delta"]!.GetValue<int>() == 1 && gcRow["gen1_count_delta"]!.GetValue<int>() == 3);
+    var tpRow = lines.Select(l => JsonNode.Parse(l)!.AsObject()).First(o => o["type"]!.GetValue<string>() == "teleport");
+    Check("events teleport row", tpRow["player"]!.GetValue<string>() == "Nick" && tpRow["distance"]!.GetValue<double>() == 500 && tpRow["from"]!.AsArray().Count == 3 && tpRow["to"]![0]!.GetValue<double>() == 500 && tpRow["source"]!.GetValue<string>() == "game");
+    var toolRow = lines.Select(l => JsonNode.Parse(l)!.AsObject()).First(o => o["type"]!.GetValue<string>() == "census_end");
+    Check("events tool row", toolRow["source"]!.GetValue<string>() == "tool" && toolRow["entity_total"]!.GetValue<long>() == 42 && toolRow["duration_ms"]!.GetValue<double>() == 1.25);
+
+    // Events: thread safety of the counters
+    var evPar = new EventLog(evClock);
+    Parallel.For(0, 4, _ => { for (int i = 0; i < 25000; i++) evPar.ChunkLoaded(); });
+    evPar.Flush(1000);
+    Check("events counters lose nothing across threads", JsonNode.Parse(evPar.Lines()[0])!["loaded"]!.GetValue<int>() == 100000 && evPar.HandlerCalls == 100000);
+
+    // Events: file round trip and summary
+    string evDir = Path.Combine(Path.GetTempPath(), "sparkvs-evtest-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(evDir);
+    ev.Write(Path.Combine(evDir, ExtraSections.EventsFile));
+    var evFile = File.ReadAllLines(Path.Combine(evDir, ExtraSections.EventsFile));
+    Check("events file has header then rows", evFile.Length == ev.RowCount + 1 && JsonNode.Parse(evFile[0])!["type"]!.GetValue<string>() == "header" && JsonNode.Parse(evFile[0])!["series"]!.GetValue<string>() == "events");
+    var evSum = EventLog.Summarize(Path.Combine(evDir, ExtraSections.EventsFile));
+    Check("events summary", evSum.Present && evSum.Loaded == 4 && evSum.Unloaded == 1 && evSum.ClientReceived == 2 && evSum.Teleports.Count == 1 && evSum.Gen2Collections == 1 && evSum.ToolRows.Count == 2, $"{evSum.Loaded} {evSum.Unloaded} {evSum.ClientReceived} {evSum.Teleports.Count} {evSum.Gen2Collections} {evSum.ToolRows.Count}");
+
+    // Teleport threshold and gc watcher
+    var td = new TeleportDetector();
+    Check("teleport first sighting is silent", td.Observe("a", 0, 0, 0, 0) == null);
+    Check("teleport exactly 64 blocks is not a jump", td.Observe("a", 64, 0, 0, 0) == null);
+    var jump = td.Observe("a", 64 + 65, 0, 0, 0);
+    Check("teleport over 64 blocks", jump != null && Math.Abs(jump.Distance - 65) < 1e-9 && jump.FromX == 64 && jump.ToX == 129);
+    Check("teleport small steps never fire", Enumerable.Range(0, 10).All(i => td.Observe("a", 129 + i * 60.0, 0, 0, 0) == null));
+    var dimJump = td.Observe("a", 129 + 9 * 60.0, 0, 0, 1);
+    Check("teleport dimension change fires", dimJump != null && dimJump.FromDimension == 0 && dimJump.ToDimension == 1);
+    Check("teleport 3d distance counts height", new TeleportDetector().Observe("b", 0, 0, 0, 0) == null);
+    var td3 = new TeleportDetector();
+    td3.Observe("p", 0, 0, 0, 0);
+    Check("teleport vertical drop over threshold", td3.Observe("p", 0, 100, 0, 0) != null);
+    td3.Retain(new List<string>());
+    Check("teleport rejoin is a first sighting", td3.Observe("p", 5000, 0, 0, 0) == null);
+    var gw = new GcWatcher();
+    Check("gc watcher baseline", !gw.Observe(5, 2, out _, out _));
+    Check("gc watcher gen1 only is quiet", !gw.Observe(9, 2, out int g1a, out int g2a) && g1a == 4 && g2a == 0);
+    Check("gc watcher gen2 rise", gw.Observe(11, 3, out int g1b, out int g2b) && g1b == 2 && g2b == 1);
+    try { Directory.Delete(evDir, true); } catch (IOException) { }
+
+    // Census and events sections of a bundle folder, server summary
+    string secDir = Path.Combine(Path.GetTempPath(), "sparkvs-sectest-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(secDir);
+    BundleWriter.WriteJson(Path.Combine(secDir, ExtraSections.CensusStartFile), cen.ToJson(2));
+    BundleWriter.WriteJson(Path.Combine(secDir, ExtraSections.CensusEndFile), EntityCensus.Build(endEnts, "server").ToJson(2));
+    ev.Write(Path.Combine(secDir, ExtraSections.EventsFile));
+    var metaNode = new JsonObject
+    {
+        ["mode"] = "server", ["label"] = "t", ["game_version"] = "1.22.7", ["started_local"] = "x", ["duration_sec"] = 5, ["requested_seconds"] = 5, ["entity_source"] = "test",
+        [ExtraSections.OverheadKey] = new JsonObject { ["event_handler_calls"] = 7, ["event_handler_ns"] = 700, ["event_handler_ns_per_call"] = 100.0, ["census_start_ms"] = 0.5, ["census_end_ms"] = 0.6, ["events_sampler_ticks"] = 6, ["events_sampler_errors"] = 0 },
+        ["bundle"] = JsonSerializer.SerializeToNode(new BundleSummary()),
+    };
+    BundleWriter.WriteJson(Path.Combine(secDir, ReportBuilder.MetaFile), metaNode);
+    var sdiff = ExtraSections.LoadCensusDiff(secDir, out string? sreason, out _, out _);
+    Check("sections load census diff", sdiff != null && sreason == null && sdiff.ByCode.Count == 3);
+    string serverMd = ExtraSections.ServerSummaryMarkdown(secDir);
+    Check("server summary has census, events and overhead", serverMd.Contains("## Entity census") && serverMd.Contains("lop:raptor") && serverMd.Contains("## Events") && serverMd.Contains("Overhead of the event and census collection") && serverMd.Contains("700 ns"), serverMd.Length.ToString());
+    var emptyDir = Path.Combine(secDir, "empty");
+    Directory.CreateDirectory(emptyDir);
+    Check("sections degrade when files are absent", ExtraSections.CensusEventsMarkdown(emptyDir).Contains("Not collected") && ExtraSections.LoadCensusDiff(emptyDir, out string? absentReason, out _, out _) == null && absentReason != null);
+    try { Directory.Delete(secDir, true); } catch (IOException) { }
+
+    // Config: migration, durations, ring size, bad file name
+    var oldCfg = new SparkVSConfig { ConfigSchema = 0, DefaultDurationSec = 120, MaxDurationSec = 300 };
+    Check("config migrates old defaults", oldCfg.Migrate(out string mig1) && oldCfg.DefaultDurationSec == 600 && oldCfg.MaxDurationSec == 1800 && oldCfg.ConfigSchema == 2 && mig1.Contains("raised"), mig1);
+    var custom = new SparkVSConfig { ConfigSchema = 0, DefaultDurationSec = 90, MaxDurationSec = 300 };
+    Check("config keeps customized values", custom.Migrate(out string mig2) && custom.DefaultDurationSec == 90 && custom.MaxDurationSec == 300 && custom.ConfigSchema == 2 && mig2.Contains("kept"), mig2);
+    var customMax = new SparkVSConfig { ConfigSchema = 1, DefaultDurationSec = 120, MaxDurationSec = 900 };
+    Check("config keeps a customized max even with default length", customMax.Migrate(out _) && customMax.DefaultDurationSec == 120 && customMax.MaxDurationSec == 900);
+    var current = SparkVSConfig.CreateDefault();
+    Check("config new default is schema 2, 600/1800", current.ConfigSchema == 2 && current.DefaultDurationSec == 600 && current.MaxDurationSec == 1800 && !current.Migrate(out _));
+    Check("config file without ConfigSchema deserializes to 0", JsonSerializer.Deserialize<SparkVSConfig>("{\"DefaultDurationSec\":120,\"MaxDurationSec\":300}")!.ConfigSchema == 0);
+    Check("config hard cap is 7200", SparkVSConfig.HardMaxSeconds == 7200);
+    Check("frame ring covers 3500 fps for the capture", new[] { 1, 60, 300, 600, 1800 }.All(s => SparkVSConfig.FrameRingCapacityFor(s) >= 3500L * s || SparkVSConfig.FrameRingCapacityFor(s) == (1 << 23)));
+    Check("frame ring capped at 8M entries", SparkVSConfig.FrameRingCapacityFor(7200) == (1 << 23) && SparkVSConfig.FrameRingCapacityFor(1800) == (1 << 23) && SparkVSConfig.FrameRingCapacityFor(1) == (1 << 16));
+    Check("bad config name", SparkVSConfig.BadFileName(@"C:\x\SparkVS.json", new DateTime(2026, 11, 8, 13, 5, 9)) == @"C:\x\SparkVS.json.bad-20261108130509");
+}
+// ===== END capture-fixes worker A tests =====
+
+// ===== BEGIN capture-fixes worker C tests: entity tick timing accumulation =====
+{
+    var propsA = new object(); var propsB = new object(); var propsA2 = new object();
+    var acc = new SparkVS.Core.EntityTickAccumulator();
+    Check("tick acc: first thread owns", acc.AcceptsThread(7) && acc.AcceptsThread(7) && !acc.AcceptsThread(8) && acc.DroppedOffThread == 1);
+    acc.Add(propsA, 100); acc.Add(propsA, 300); acc.Add(propsB, 50); acc.Add(propsA2, 1000);
+    Check("tick acc: totals", acc.CallsTotal == 4 && acc.TicksTotal == 1450 && acc.KeyCount == 3);
+    (string, string) Res(object k) => k == propsB ? ("game:pig-wild-female", "game") : ("game:chicken-hen", "game");
+    // QPC frequency 1e6 means 1 tick = 1 us, 1000 ticks = 1 ms.
+    var file = SparkVS.Core.EntityTickReport.Build(acc, Res, 1_000_000, 42.5, 10, "T.M", "n");
+    var rows = file["rows"]!.AsArray();
+    Check("tick table: two merged rows, hens first", rows.Count == 2 && rows[0]!["code"]!.GetValue<string>() == "game:chicken-hen" && rows[1]!["code"]!.GetValue<string>() == "game:pig-wild-female");
+    Check("tick table: hen numbers", rows[0]!["calls"]!.GetValue<long>() == 3 && Math.Abs(rows[0]!["total_ms"]!.GetValue<double>() - 1.4) < 1e-9 && Math.Abs(rows[0]!["max_us"]!.GetValue<double>() - 1000) < 1e-9 && Math.Abs(rows[0]!["mean_us"]!.GetValue<double>() - 466.667) < 1e-3);
+    Check("tick table: share sums to 100", Math.Abs(rows.Sum(r => r!["share_pct"]!.GetValue<double>()) - 100) < 0.02 && Math.Abs(rows[1]!["share_pct"]!.GetValue<double>() - 3.45) < 0.01);
+    Check("tick table: totals and overhead", file["wrapped_calls_total"]!.GetValue<long>() == 4 && file["wrapper_overhead_estimate_ns"]!.GetValue<double>() == 42.5 && file["note"]!.GetValue<string>().Contains("physics worker threads"));
+    acc.Freeze(); acc.Add(propsA, 5);
+    Check("tick acc: frozen add dropped", acc.CallsTotal == 4 && acc.DroppedFrozen == 1);
+    var accNull = new SparkVS.Core.EntityTickAccumulator();
+    accNull.Add(null, 3);
+    Check("tick acc: null key allowed", accNull.CallsTotal == 1);
+    var off = SparkVS.Core.EntityTickReport.Disabled("why");
+    Check("tick disabled form + markdown", off["enabled"]!.GetValue<bool>() == false && SparkVS.Core.EntityTickReport.Markdown(off).Contains("Not collected: why"));
+    var tickMd = SparkVS.Core.EntityTickReport.Markdown(file, 1);
+    Check("tick markdown: top-N rows, section title", tickMd.Contains("## Entity tick time") && tickMd.Contains("chicken-hen") && !tickMd.Contains("pig-wild-female"));
+    double ns = SparkVS.Core.EntityTickAccumulator.Calibrate(20000);
+    Check("tick calibration plausible", ns > 0 && ns < 5000);
+}
+// ===== END capture-fixes worker C tests =====
 
 Console.WriteLine($"tests passed={passed} failed={failed}");
 return failed == 0 ? 0 : 1;

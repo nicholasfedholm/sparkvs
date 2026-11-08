@@ -87,8 +87,13 @@ public static class Program
         Console.WriteLine("sparkx " + Version + ": per-mod live memory for a running Vintage Story process (managed heap only)");
         Console.WriteLine();
         Console.WriteLine("  sparkx list");
-        Console.WriteLine("  sparkx memory [--pid N] [--out DIR] [--top N] [--data DIR]");
+        Console.WriteLine("  sparkx memory [--pid N] [--out DIR] [--top N] [--data DIR] [--snapshot-attempts 3]");
         Console.WriteLine("  sparkx watch  [--pid N] [--minutes M] [--snapshot-every K] [--out DIR] [--top N] [--data DIR]");
+        Console.WriteLine("                [--start-delay 60] [--start-max-wait 600] [--snapshot-attempts 3]");
+        Console.WriteLine();
+        Console.WriteLine("watch: the first snapshot waits --start-delay seconds after attach AND for the GC heap to change under 5 % across the last 3");
+        Console.WriteLine("5-second samples, gives up after --start-max-wait seconds (start_condition=timeout). A snapshot is complete only if it");
+        Console.WriteLine("finished with no events lost; otherwise it is retried up to --snapshot-attempts times (each attempt forces a full GC).");
         Console.WriteLine();
         Console.WriteLine("Without --pid exactly one Vintagestory or VintagestoryServer process must be running.");
         Console.WriteLine("The target needs a diagnostics port (the .NET default). Same user, same elevation.");
@@ -159,7 +164,9 @@ public static class Program
         string outDir = args.Get("out") ?? Path.Combine(Directory.GetCurrentDirectory(), "sparkx-memory-" + DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture));
         var resolver = ExternalModResolver.Create(pid, args.Get("data"));
         Console.WriteLine("snapshotting pid " + pid.ToString(CultureInfo.InvariantCulture) + " ...");
-        var snap = HeapDumpEventPipe.Capture(pid, TimeSpan.FromMinutes(10), m => Console.WriteLine("  " + m));
+        int attempts = Math.Clamp(args.GetInt("snapshot-attempts", SnapshotPolicy.DefaultAttempts), 1, 10);
+        var snap = HeapDumpEventPipe.Capture(pid, TimeSpan.FromMinutes(10), m => Console.WriteLine("  " + m), attempts);
+        snap.StartCondition = "immediate";
         var table = MemoryReport.Build(snap, resolver, null, "");
         MemoryReport.Write(outDir, table, top, FrontEnd);
         PrintSummary(table, top);
@@ -171,7 +178,7 @@ public static class Program
     {
         var inv = CultureInfo.InvariantCulture;
         var s = table.Snapshot;
-        Console.WriteLine("route: " + s.Route + ", complete: " + s.Complete + ", events lost: " + s.EventsLost.ToString(inv)
+        Console.WriteLine("route: " + s.Route + ", complete: " + s.Complete + ", attempts: " + s.Attempts.ToString(inv) + ", events lost: " + s.EventsLost.ToString(inv)
             + ", dump GC pause: " + s.GcPauseMs.ToString("0.0", inv) + " ms, took " + s.ElapsedMs.ToString("0", inv) + " ms");
         Console.WriteLine("live: " + MemoryReport.Mb(table.TotalLiveBytes).ToString("0.0", inv) + " MB in " + table.TotalLiveObjects.ToString("N0", inv) + " objects");
         foreach (var w in s.Warnings) Console.WriteLine("warning: " + w);

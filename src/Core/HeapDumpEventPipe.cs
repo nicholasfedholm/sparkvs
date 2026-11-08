@@ -53,28 +53,65 @@ public static class HeapDumpEventPipe
     /// Takes one live-heap snapshot of the process. EventPipe holds events written by idle threads in buffers
     /// (observed up to about 15 s for the induced GC's own events, or indefinitely), so the dump GC end event can
     /// arrive late. When no event has arrived for a while the session is stopped, which flushes everything, and the
-    /// result is checked for the dump GC end. An incomplete result is retried (up to 3 attempts, each waiting longer).
+    /// result is checked for the dump GC end.
+    /// Complete means finished, no reader error, dump GC observed and zero events lost. Anything else is retried, on every
+    /// failure path (losses, timeout, exception), up to maxAttempts times with a larger circular buffer each time. Each attempt
+    /// forces a full GC and is recorded in HeapSnapshot.AttemptLog. When no attempt completes, the attempt with the most data is
+    /// returned (a lower bound, Complete false). timeout applies to each attempt.
+    /// onAttempt is called after every attempt (use it to log the forced GC as a tool event).
     /// </summary>
-    public static HeapSnapshot Capture(int pid, TimeSpan timeout, Action<string>? log = null)
+    public static HeapSnapshot Capture(int pid, TimeSpan timeout, Action<string>? log = null,
+        int maxAttempts = SnapshotPolicy.DefaultAttempts, Action<SnapshotAttempt>? onAttempt = null)
     {
+        if (maxAttempts < 1) maxAttempts = 1;
         var total = Stopwatch.StartNew();
-        HeapSnapshot snap;
-        int attempt = 0;
-        while (true)
+        var attempts = new List<SnapshotAttempt>();
+        HeapSnapshot? best = null;
+        int baseMb = ChooseBufferMB(pid);
+        for (int attempt = 0; ; attempt++)
         {
-            snap = CaptureOnce(pid, timeout, log, attempt, out bool retry);
-            if (snap.Complete || !retry || attempt >= 2 || total.Elapsed > timeout) break;
-            log?.Invoke("dump GC not observed to finish, retrying (attempt " + (attempt + 2) + " of 3)");
-            attempt++;
+            int bufferMb = SnapshotPolicy.BufferForAttempt(baseMb, attempt);
+            var one = CaptureOnce(pid, timeout, log, attempt, bufferMb);
+            var rec = new SnapshotAttempt
+            {
+                Attempt = attempt + 1,
+                BufferMB = bufferMb,
+                GcPauseMs = one.GcPauseMs > 0 ? one.GcPauseMs : -1,
+                EventsLost = one.EventsLost,
+                Complete = one.Complete,
+                ElapsedMs = one.ElapsedMs,
+                Outcome = OutcomeOf(one),
+            };
+            attempts.Add(rec);
+            try { onAttempt?.Invoke(rec); } catch { }
+            if (best == null || one.Complete || one.LiveBytes > best.LiveBytes) best = one;
+            if (one.Complete || attempt + 1 >= maxAttempts) break;
+            log?.Invoke("snapshot attempt " + (attempt + 1) + " of " + maxAttempts + " not complete (" + rec.Outcome + "), retrying with a larger buffer");
         }
+        var snap = best!;
+        snap.AttemptLog = attempts;
+        snap.Attempts = attempts.Count;
         snap.ElapsedMs = total.Elapsed.TotalMilliseconds;
-        if (attempt > 0) snap.Warnings.Add("needed " + (attempt + 1) + " attempts (the earlier attempts also ran a dump GC)");
+        if (attempts.Count > 1)
+            snap.Warnings.Add((snap.Complete ? "needed " : "still incomplete after ") + attempts.Count + " attempts (every attempt forced a full GC)");
         return snap;
     }
 
-    static HeapSnapshot CaptureOnce(int pid, TimeSpan timeout, Action<string>? log, int attempt, out bool retry)
+    static string OutcomeOf(HeapSnapshot s)
     {
-        retry = false;
+        if (s.Complete) return "complete";
+        foreach (var w in s.Warnings)
+        {
+            if (w.StartsWith("capture failed", StringComparison.Ordinal)) return "exception";
+            if (w.StartsWith("timeout", StringComparison.Ordinal)) return "timeout";
+            if (w.StartsWith("reader failed", StringComparison.Ordinal)) return "reader error";
+        }
+        if (s.EventsLost > 0) return "events lost";
+        return "dump GC not observed";
+    }
+
+    static HeapSnapshot CaptureOnce(int pid, TimeSpan timeout, Action<string>? log, int attempt, int bufferMb)
+    {
         var sw = Stopwatch.StartNew();
         double wsGb = 0;
         try { using var p0 = Process.GetProcessById(pid); wsGb = p0.WorkingSet64 / 1073741824.0; } catch { }
@@ -118,7 +155,6 @@ public static class HeapDumpEventPipe
             var client = new DiagnosticsClient(pid);
             long keywords = (long)(ClrTraceEventParser.Keywords.GCHeapSnapshot | ClrTraceEventParser.Keywords.Loader);
             var providers = new[] { new EventPipeProvider(RuntimeProvider, EventLevel.Verbose, keywords) };
-            int bufferMb = ChooseBufferMB(pid);
             LastCircularBufferMB = bufferMb;
             session = client.StartEventPipeSession(providers, requestRundown: true, circularBufferMB: bufferMb);
             log?.Invoke("event pipe session started");
@@ -246,14 +282,11 @@ public static class HeapDumpEventPipe
             if (readerError != null) snap.Warnings.Add("reader failed: " + readerError.GetType().Name + ": " + readerError.Message);
 
             snap.EventsLost = eventsLost;
-            snap.Complete = finished && readerError == null && state == 2;
+            snap.Complete = SnapshotPolicy.IsComplete(finished, readerError != null, state, eventsLost);
             if (state != 2 && finished && readerError == null)
-            {
                 snap.Warnings.Add("the dump GC was not observed to complete");
-                retry = eventsLost == 0;
-            }
             if (eventsLost > 0)
-                snap.Warnings.Add("events lost: per-type numbers are a lower bound");
+                snap.Warnings.Add("events lost: " + eventsLost + "; per-type numbers are a lower bound and the snapshot is NOT complete");
             if (state == 2)
             {
                 snap.GcPauseMs = Math.Max(0, endMs - startMs);

@@ -104,9 +104,50 @@ public static class ReportBuilder
                 AddSection(sections, notCollected, reasons, key, file, ExtraSections.Headline(file, doc), doc);
             }
         }
+        if (captureDir != null) AddCensusAndEvents(captureDir, sections, notCollected, reasons);
         node["not_collected"] = notCollected;
         node["not_collected_reasons"] = reasons;
         return node.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    /// <summary>Entity census diff, event counts and the cost of collecting them, for summary.json.</summary>
+    static void AddCensusAndEvents(string dir, JsonObject sections, JsonArray notCollected, JsonObject reasons)
+    {
+        var diff = ExtraSections.LoadCensusDiff(dir, out string? reason, out var start, out var end);
+        if (diff == null) { notCollected.Add("census-start.json/census-end.json"); reasons["census-start.json/census-end.json"] = reason ?? "absent"; }
+        else
+        {
+            sections["entity_census"] = new JsonObject
+            {
+                ["label"] = "measured",
+                ["detail_file"] = "census-end.json",
+                ["side"] = end!.Side,
+                ["census_duration_ms"] = new JsonObject { ["start"] = Math.Round(start!.DurationMs, 2), ["end"] = Math.Round(end.DurationMs, 2) },
+                ["densest_chunk_at_end"] = end.ToJson(BuildInfo.SchemaVersion)["densest_chunk"]?.DeepClone(),
+                ["diff"] = diff.ToJson(10),
+            };
+        }
+        string eventsPath = Path.Combine(dir, ExtraSections.EventsFile);
+        if (!File.Exists(eventsPath)) { notCollected.Add(ExtraSections.EventsFile); reasons[ExtraSections.EventsFile] = "file absent from the bundle"; }
+        else
+        {
+            var ev = EventLog.Summarize(eventsPath);
+            sections["events"] = new JsonObject
+            {
+                ["label"] = "measured",
+                ["detail_file"] = ExtraSections.EventsFile,
+                ["rows_by_type"] = JsonSerializer.SerializeToNode(ev.ByType),
+                ["server_chunks_loaded"] = ev.Loaded,
+                ["server_chunks_unloaded"] = ev.Unloaded,
+                ["client_chunks_received"] = ev.ClientReceived,
+                ["busiest_second_loads"] = ev.PeakLoadedInSecond,
+                ["gen2_collections_seen"] = ev.Gen2Collections,
+                ["teleports"] = ev.Teleports.Count,
+                ["tool_rows"] = ev.ToolRows.Count,
+            };
+        }
+        var overhead = ExtraSections.LoadOverhead(dir);
+        if (overhead != null) sections["event_collection_overhead"] = new JsonObject { ["label"] = "measured", ["detail_file"] = ReportBuilder.MetaFile, ["data"] = overhead.DeepClone() };
     }
 
     static void AddSection(JsonObject sections, JsonArray notCollected, JsonObject reasons, string key, string file, JsonObject headline, JsonObject? doc)
