@@ -62,6 +62,9 @@ public sealed class CaptureMeta
     public int MainThreadOsId { get; set; }
     public int ServerThreadOsId { get; set; }
     public bool IntegratedServer { get; set; }
+    /// <summary>"server" for a capture taken on a dedicated server. Null (and so absent from the JSON) for a client capture.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Side { get; set; }
     public string SamplingRateKnob { get; set; } = "";
     public double SpikeThresholdMs { get; set; } = 50;
     public Dictionary<string, string> AssemblyToMod { get; set; } = new();
@@ -155,6 +158,11 @@ public sealed class Report
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public BundleSummary? Bundle { get; set; }
 
+    /// <summary>"server" for a dedicated server capture; null (absent from the JSON) for a client capture.</summary>
+    [JsonPropertyName("side")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Side { get; set; }
+
     public string Label { get; set; } = "";
     public string World { get; set; } = "";
     public string GameVersion { get; set; } = "";
@@ -212,6 +220,12 @@ public sealed class TickStats
     [JsonPropertyName("p95_mspt_ms")] public double P95MsptMs { get; set; }
     [JsonPropertyName("max_mspt_ms")] public double MaxMsptMs { get; set; }
     [JsonPropertyName("mean_interval_ms")] public double MeanIntervalMs { get; set; }
+
+    // Dedicated server captures only; null (absent from the JSON) for the integrated server.
+    [JsonPropertyName("mean_tps")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public double? MeanTps { get; set; }
+    [JsonPropertyName("p95_interval_ms")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public double? P95IntervalMs { get; set; }
+    [JsonPropertyName("max_interval_ms")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public double? MaxIntervalMs { get; set; }
+    [JsonPropertyName("mspt_source")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? MsptSource { get; set; }
 }
 
 public sealed class HeapStats
@@ -247,8 +261,11 @@ public sealed class BundleSummary
     [JsonPropertyName("schema_version")] public int SchemaVersion { get; set; } = 1;
     [JsonPropertyName("start_local")] public string StartLocal { get; set; } = "";
     [JsonPropertyName("sparkvs_version")] public string SparkVsVersion { get; set; } = "";
-    [JsonPropertyName("frames")] public FramesStats Frames { get; set; } = new();
+    /// <summary>"server" for a dedicated server bundle (no frames or VRAM sections); null (absent from the JSON) for a client bundle.</summary>
+    [JsonPropertyName("side")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? Side { get; set; }
+    // Null (absent from the JSON) on a dedicated server bundle, which has no frames or VRAM series.
+    [JsonPropertyName("frames")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public FramesStats? Frames { get; set; } = new();
     [JsonPropertyName("tick")] public TickStats Tick { get; set; } = new();
     [JsonPropertyName("heap")] public HeapStats Heap { get; set; } = new();
-    [JsonPropertyName("vram")] public VramStats Vram { get; set; } = new();
+    [JsonPropertyName("vram")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public VramStats? Vram { get; set; } = new();
 }

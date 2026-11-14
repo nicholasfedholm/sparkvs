@@ -35,30 +35,32 @@ public static class SummaryWriter
         sb.AppendLine();
         if (labelled && r.Bundle != null) AppendBundle(sb, r);
 
-        var main = r.Threads.FirstOrDefault(t => t.Role == "client-main");
+        bool server = CaptureSide.IsServer(r.Side);
+        string mainLabel = CaptureSide.MainLabel(r.Side);
+        var main = Analyzer.FindMain(r);
         if (main == null)
         {
-            sb.AppendLine("No client main thread samples in this capture.");
+            sb.AppendLine("No " + mainLabel.ToLowerInvariant() + " samples in this capture.");
             sb.AppendLine();
         }
         else
         {
-            sb.AppendLine("## Client main thread: top 15 methods by self time" + Tag("estimated"));
+            sb.AppendLine("## " + mainLabel + ": top 15 methods by self time" + Tag("estimated"));
             sb.AppendLine();
             sb.AppendLine("| Self ms | Self % | Total % | Method | Assembly | Owner |");
             sb.AppendLine("|---:|---:|---:|---|---|---|");
             foreach (var m in main.Methods.Take(15))
                 sb.AppendLine($"| {N(m.SelfMs, 0)} | {N(m.SelfPct)} | {N(m.TotalPct)} | {Cell(Analyzer.ShortName(m.Method))} | {Cell(m.Module)} | {Cell(m.Owner)} |");
             sb.AppendLine();
-            sb.AppendLine("## Client main thread: by owning mod" + Tag("estimated"));
+            sb.AppendLine("## " + mainLabel + ": by owning mod" + Tag("estimated"));
             sb.AppendLine();
             sb.AppendLine("Self bills each sample to the first non runtime frame up from the leaf. Inclusive is any frame of that owner anywhere in the stack.");
             sb.AppendLine();
             AppendGroups(sb, main.ByMod, 15, "Owner");
-            sb.AppendLine("## Client main thread: by assembly" + Tag("estimated"));
+            sb.AppendLine("## " + mainLabel + ": by assembly" + Tag("estimated"));
             sb.AppendLine();
             AppendGroups(sb, main.ByAssembly, 15, "Assembly");
-            sb.AppendLine("## Client main thread: top call paths (leaf side, 8 frames)" + Tag("estimated"));
+            sb.AppendLine("## " + mainLabel + ": top call paths (leaf side, 8 frames)" + Tag("estimated"));
             sb.AppendLine();
             sb.AppendLine("| Ms | % | Path |");
             sb.AppendLine("|---:|---:|---|");
@@ -67,20 +69,31 @@ public static class SummaryWriter
             sb.AppendLine();
         }
 
-        sb.AppendLine($"## Frames over {N(r.SpikeThresholdMs, 0)} ms: {r.SpikesOverThreshold} of {r.FrameCount}" + (r.SpikesDropped > 0 ? $" ({r.SpikesDropped} not recorded, buffer full)" : "") + Tag("measured: frame times; estimated: the dominant method and owner"));
-        sb.AppendLine();
-        sb.AppendLine("| At s | Frame ms | Samples in frame | Dominant method | Owner | Gen0/1/2 |");
-        sb.AppendLine("|---:|---:|---:|---|---|---|");
-        foreach (var s in r.Spikes.Take(15))
-            sb.AppendLine($"| {N(s.AtSec)} | {N(s.DurationMs)} | {s.SamplesInFrame} | {Cell(s.DominantMethod)} | {Cell(s.DominantOwner)} | {s.Gen0}/{s.Gen1}/{s.Gen2} |");
-        sb.AppendLine();
+        if (!server)
+        {
+            sb.AppendLine($"## Frames over {N(r.SpikeThresholdMs, 0)} ms: {r.SpikesOverThreshold} of {r.FrameCount}" + (r.SpikesDropped > 0 ? $" ({r.SpikesDropped} not recorded, buffer full)" : "") + Tag("measured: frame times; estimated: the dominant method and owner"));
+            sb.AppendLine();
+            sb.AppendLine("| At s | Frame ms | Samples in frame | Dominant method | Owner | Gen0/1/2 |");
+            sb.AppendLine("|---:|---:|---:|---|---|---|");
+            foreach (var s in r.Spikes.Take(15))
+                sb.AppendLine($"| {N(s.AtSec)} | {N(s.DurationMs)} | {s.SamplesInFrame} | {Cell(s.DominantMethod)} | {Cell(s.DominantOwner)} | {s.Gen0}/{s.Gen1}/{s.Gen2} |");
+            sb.AppendLine();
+        }
         sb.AppendLine($"GC collections during capture: gen0 {r.Gen0}, gen1 {r.Gen1}, gen2 {r.Gen2}.");
         sb.AppendLine();
 
         sb.AppendLine("## Capture overhead" + Tag("measured"));
         sb.AppendLine();
-        sb.AppendLine($"- Fps in the seconds before the session vs during it: {N(r.BaselineFps)} vs {N(r.CaptureFps)} ({N(r.CaptureFpsDeltaPct)} %). The scene can change during a capture, so the bench A/B is the real gate.");
-        sb.AppendLine($"- Stream reader thread allocated {r.SamplerBytesAllocated:N0} bytes; frame hook allocated {r.FrameHookBytesAllocated:N0} bytes.");
+        if (!server)
+        {
+            sb.AppendLine($"- Fps in the seconds before the session vs during it: {N(r.BaselineFps)} vs {N(r.CaptureFps)} ({N(r.CaptureFpsDeltaPct)} %). The scene can change during a capture, so the bench A/B is the real gate.");
+            sb.AppendLine($"- Stream reader thread allocated {r.SamplerBytesAllocated:N0} bytes; frame hook allocated {r.FrameHookBytesAllocated:N0} bytes.");
+        }
+        else
+        {
+            sb.AppendLine("- Tick cost with versus without the session is not measured here; compare the tick series (tick.jsonl) of a capture against one taken without SparkVS sampling.");
+            sb.AppendLine($"- Stream reader thread allocated {r.SamplerBytesAllocated:N0} bytes.");
+        }
         sb.AppendLine($"- Trace size {N(r.NettraceBytes / 1048576.0)} MB. Runtime sampling rate: {(r.SamplingRateKnob.Length > 0 ? r.SamplingRateKnob + " (DOTNET_EventPipeThreadSamplingRate, hex ms, set at game launch)" : "not set, runtime default of about 1 ms")}.");
         sb.AppendLine($"- Stack capture: {r.SamplesWithResolvedStack:N0} of {r.TotalSamples:N0} samples resolved; main thread {r.MainThreadSamples:N0} samples, {N(r.MainResolvedPct)} % resolved, mean interval {N(r.MainMeanIntervalMs, 2)} ms.");
         sb.AppendLine();
@@ -104,19 +117,31 @@ public static class SummaryWriter
         sb.AppendLine("Labels: **measured** is read straight from a counter or timer; **estimated** is derived by sampling or inference; **experimental** is a new hook not yet proven in a game run. Bundle schema_version " + b.SchemaVersion + ", SparkVS " + b.SparkVsVersion + ", capture start " + b.StartLocal + ".");
         sb.AppendLine();
 
-        var f = b.Frames;
-        sb.AppendLine("## Frames [measured]");
-        sb.AppendLine();
-        sb.AppendLine($"- {f.FrameCount:N0} frames in {N(f.DurationMs / 1000.0, 1)} s, mean {N(f.MeanFps)} fps (mean frame {N(f.MeanFrameMs, 2)} ms). Present mode is not measured in process; the bench runner records it, and no fps number here is quotable without it.");
-        sb.AppendLine($"- Frame ms: p50 {N(f.P50FrameMs, 2)}, p95 {N(f.P95FrameMs, 2)}, p99 {N(f.P99FrameMs, 2)}, max {N(f.MaxFrameMs, 2)}. 1 percent low {N(f.OnePercentLowFps)} fps (mean of the slowest 1 percent of frames).");
-        sb.AppendLine($"- {f.OverThresholdCount} frames over {N(f.OverThresholdMs, 0)} ms, listed with nearest stack and GC deltas in frames-summary.json. Per frame series: frames.jsonl" + (f.DroppedOldestFrames > 0 ? $" ({f.DroppedOldestFrames} oldest frames overwritten, ring full)." : "."));
-        sb.AppendLine();
+        bool server = CaptureSide.IsServer(b.Side);
+        if (!server)
+        {
+            var f = b.Frames ?? new FramesStats();
+            sb.AppendLine("## Frames [measured]");
+            sb.AppendLine();
+            sb.AppendLine($"- {f.FrameCount:N0} frames in {N(f.DurationMs / 1000.0, 1)} s, mean {N(f.MeanFps)} fps (mean frame {N(f.MeanFrameMs, 2)} ms). Present mode is not measured in process; the bench runner records it, and no fps number here is quotable without it.");
+            sb.AppendLine($"- Frame ms: p50 {N(f.P50FrameMs, 2)}, p95 {N(f.P95FrameMs, 2)}, p99 {N(f.P99FrameMs, 2)}, max {N(f.MaxFrameMs, 2)}. 1 percent low {N(f.OnePercentLowFps)} fps (mean of the slowest 1 percent of frames).");
+            sb.AppendLine($"- {f.OverThresholdCount} frames over {N(f.OverThresholdMs, 0)} ms, listed with nearest stack and GC deltas in frames-summary.json. Per frame series: frames.jsonl" + (f.DroppedOldestFrames > 0 ? $" ({f.DroppedOldestFrames} oldest frames overwritten, ring full)." : "."));
+            sb.AppendLine();
+        }
 
         var t = b.Tick;
-        sb.AppendLine("## Server tick, integrated server [experimental]");
+        sb.AppendLine(server ? "## Server tick, dedicated server [experimental]" : "## Server tick, integrated server [experimental]");
         sb.AppendLine();
         if (t.Enabled)
-            sb.AppendLine($"- {t.TickCount:N0} ticks: mean {N(t.MeanMsptMs, 2)} ms, p95 {N(t.P95MsptMs, 1)} ms, max {N(t.MaxMsptMs, 1)} ms of work per tick (whole ms resolution). Mean tick period {N(t.MeanIntervalMs, 1)} ms. Series: tick.jsonl.");
+        {
+            if (server && t.MsptSource != null && t.MsptSource.StartsWith("unavailable", System.StringComparison.Ordinal))
+                sb.AppendLine($"- {t.TickCount:N0} ticks, tick period only (work time per tick unavailable: {t.Reason}). Mean period {N(t.MeanIntervalMs, 1)} ms ({N(t.MeanTps ?? 0, 2)} TPS), p95 {N(t.P95IntervalMs ?? 0, 1)} ms, max {N(t.MaxIntervalMs ?? 0, 1)} ms. Series: tick.jsonl.");
+            else
+            {
+                sb.AppendLine($"- {t.TickCount:N0} ticks: mean {N(t.MeanMsptMs, 2)} ms, p95 {N(t.P95MsptMs, 1)} ms, max {N(t.MaxMsptMs, 1)} ms of work per tick (whole ms resolution). Mean tick period {N(t.MeanIntervalMs, 1)} ms. Series: tick.jsonl.");
+                if (server) sb.AppendLine($"- Tick rate: {N(t.MeanTps ?? 0, 2)} TPS mean; tick period p95 {N(t.P95IntervalMs ?? 0, 1)} ms, max {N(t.MaxIntervalMs ?? 0, 1)} ms.");
+            }
+        }
         else
             sb.AppendLine("- Not collected: " + t.Reason);
         sb.AppendLine();
@@ -130,25 +155,31 @@ public static class SummaryWriter
             sb.AppendLine("- Not collected: " + h.Reason);
         sb.AppendLine();
 
-        var v = b.Vram;
-        sb.AppendLine("## VRAM, dedicated, this process [experimental until the DXGI versus PDH Local gate passes in a live run]");
-        sb.AppendLine();
-        if (v.Enabled)
+        if (!server)
         {
-            sb.AppendLine($"- Source {v.Source}, adapter {v.Adapter}, {v.Samples} samples at 1 Hz. Dedicated: start {v.StartDedicatedBytes / 1048576.0:F0} MB, end {v.EndDedicatedBytes / 1048576.0:F0} MB, peak {v.PeakDedicatedBytes / 1048576.0:F0} MB, mean {v.MeanDedicatedBytes / 1048576.0:F0} MB.");
-            if (v.PdhMeanDedicatedBytes != null)
-                sb.AppendLine($"- PDH cross-check, same ticks: mean {v.PdhMeanDedicatedBytes.Value / 1048576.0:F0} MB, DXGI differs by {N(v.DxgiVsPdhMeanDiffPercent ?? 0, 1)} percent. Series: gpu-memory.jsonl.");
+            var v = b.Vram ?? new VramStats { Reason = "no VRAM data in this bundle" };
+            sb.AppendLine("## VRAM, dedicated, this process [experimental until the DXGI versus PDH Local gate passes in a live run]");
+            sb.AppendLine();
+            if (v.Enabled)
+            {
+                sb.AppendLine($"- Source {v.Source}, adapter {v.Adapter}, {v.Samples} samples at 1 Hz. Dedicated: start {v.StartDedicatedBytes / 1048576.0:F0} MB, end {v.EndDedicatedBytes / 1048576.0:F0} MB, peak {v.PeakDedicatedBytes / 1048576.0:F0} MB, mean {v.MeanDedicatedBytes / 1048576.0:F0} MB.");
+                if (v.PdhMeanDedicatedBytes != null)
+                    sb.AppendLine($"- PDH cross-check, same ticks: mean {v.PdhMeanDedicatedBytes.Value / 1048576.0:F0} MB, DXGI differs by {N(v.DxgiVsPdhMeanDiffPercent ?? 0, 1)} percent. Series: gpu-memory.jsonl.");
+                else
+                    sb.AppendLine("- PDH cross-check unavailable in this run.");
+                sb.AppendLine("- " + VramGate.Describe(v.VramGate));
+            }
             else
-                sb.AppendLine("- PDH cross-check unavailable in this run.");
-            sb.AppendLine("- " + VramGate.Describe(v.VramGate));
+                sb.AppendLine("- Not collected: " + v.Reason);
+            sb.AppendLine();
         }
-        else
-            sb.AppendLine("- Not collected: " + v.Reason);
-        sb.AppendLine();
 
         sb.AppendLine("## Not collected in this build");
         sb.AppendLine();
-        sb.AppendLine("- Deferred on purpose, enabled false: vram-by-mod.json (deferred, see capture-stack-audit/PLAN.md).");
+        if (server)
+            sb.AppendLine("- Client only, omitted from a server bundle: " + string.Join(", ", CaptureSide.ClientOnlyFiles) + " (no render loop, frame hook or GPU on a dedicated server).");
+        else
+            sb.AppendLine("- Deferred on purpose, enabled false: vram-by-mod.json (deferred, see capture-stack-audit/PLAN.md).");
         sb.AppendLine("- Per-mod GPU time is excluded permanently: draw calls are batched across mods, so GPU time cannot be attributed to one mod.");
         sb.AppendLine();
     }

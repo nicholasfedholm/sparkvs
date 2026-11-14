@@ -129,4 +129,14 @@ public sealed class SparkVSConfig
         while (capacity < wanted && capacity < (1 << 23)) capacity <<= 1;
         return capacity;
     }
+
+    /// <summary>
+    /// Server side game event stream, key kept as EventLog (separate from events.jsonl of the capture-gap collection) (spawn, despawn, death, hurt, warning/error log lines, chat, commands, notes), replacing the standalone TestLogger mods.
+    /// "off": nothing is subscribed or patched. "capture": events go into gameevents.jsonl of each SparkVS bundle capture. "always": the same, plus a session
+    /// file under events/ in the output folder from world start. An unknown value falls back to "capture" with a warning. Read at game start; a change needs a restart.
+    /// </summary>
+    public string EventLog { get; set; } = "capture";
+
+    /// <summary>Log every Entity.OnHurt call (Harmony postfix) as hurt rows. Needs EventLog not off. Read at game start; a change needs a restart.</summary>
+    public bool HurtLog { get; set; } = true;
 }

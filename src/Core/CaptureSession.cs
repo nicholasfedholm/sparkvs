@@ -13,8 +13,29 @@ public static class Os
     [DllImport("kernel32.dll")]
     static extern uint GetCurrentThreadId();
 
-    /// <summary>The id the trace reports for a thread. Managed thread ids do not match it.</summary>
-    public static int CurrentThreadId() => (int)GetCurrentThreadId();
+    [DllImport("libc", EntryPoint = "syscall")]
+    static extern long LinuxSyscall(long number);
+
+    /// <summary>
+    /// The id the trace reports for a thread. Managed thread ids do not match it. Windows uses GetCurrentThreadId; Linux
+    /// (a dedicated server may run there) uses the gettid syscall on x64 and arm64. 0 means unknown, and the report then
+    /// finds the main thread from its stack instead.
+    /// </summary>
+    public static int CurrentThreadId()
+    {
+        try
+        {
+            if (OperatingSystem.IsWindows()) return (int)GetCurrentThreadId();
+            if (OperatingSystem.IsLinux())
+            {
+                var arch = RuntimeInformation.ProcessArchitecture;
+                if (arch == Architecture.X64) return (int)LinuxSyscall(186);
+                if (arch == Architecture.Arm64) return (int)LinuxSyscall(178);
+            }
+        }
+        catch (Exception) { }
+        return 0;
+    }
 }
 
 /// <summary>

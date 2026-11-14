@@ -131,7 +131,7 @@ public static class ExtraSections
         return sb.ToString();
     }
 
-    public static string Markdown(string dir)
+    public static string Markdown(string dir, bool server = false)
     {
         var sb = new StringBuilder();
         var cp = Load(Path.Combine(dir, "chunk-pipeline.json"));
@@ -169,8 +169,15 @@ public static class ExtraSections
         sb.AppendLine("## Asset inventory").AppendLine();
         if (ai?["enabled"]?.GetValue<bool>() != true) sb.AppendLine("- Not collected: " + (ai?["reason"]?.GetValue<string>() ?? "file absent")).AppendLine();
         else sb.AppendLine($"- Label: static. Copied from {ai["source_path"]} (scanned {ai["source_modified_local"]}). Not measured during this capture.").AppendLine();
-        sb.Append(GpuPhasesWriter.Markdown(Load(Path.Combine(dir, "gpu-phases.json"))));
+        if (!server) sb.Append(GpuPhasesWriter.Markdown(Load(Path.Combine(dir, "gpu-phases.json"))));
         sb.Append(CensusEventsMarkdown(dir));
+        // Last, and only when the capture recorded game events (EventStream): a bundle taken with EventLog off keeps the layout without this section.
+        string gameEvents = Path.Combine(dir, EventLine.FileName);
+        if (File.Exists(gameEvents))
+        {
+            try { sb.AppendLine().Append(EventSummary.FromJsonl(gameEvents).Markdown()); }
+            catch (Exception ex) { sb.AppendLine().AppendLine("## Game events").AppendLine().AppendLine("- Not summarised: " + ex.Message).AppendLine(); }
+        }
         return sb.ToString();
     }
 }

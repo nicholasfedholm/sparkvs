@@ -85,3 +85,14 @@ Honest limits (also printed in every memory.md)
 
 The SparkVS mod (0.3.0 and later) has the same engine built in: the in-game command .sparkvs memory takes the same
 kind of snapshot of the running game and writes the same files under VintagestoryData\ModData\sparkvs.
+
+Dedicated servers
+  VintagestoryServer is a supported target, same as the client. Run one sparkx watch per target PID.
+  If both the game and a server are running, --pid is required (without it sparkx lists them and exits with code 2).
+  Typical hour-long server run, explicit flags only:
+    sparkx watch --pid <server PID> --minutes 60 --out <folder>
+  Find the PID with: tasklist /fi "imagename eq VintagestoryServer.exe"
+  Windows is the tested platform. Linux is untested; sparkx uses the .NET diagnostics port, but the process
+  discovery and path handling have not been checked there. [verify after test]
+  SparkVS 0.4.0 can also capture on a dedicated server (/sparkvs capture <seconds> <label>, or SPARKVS_AUTOSTART).
+  Use it alongside sparkx: SparkVS gives tick/TPS, CPU samples and allocations, sparkx gives live memory per mod.

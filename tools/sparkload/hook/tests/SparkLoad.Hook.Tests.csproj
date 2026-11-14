@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OptimumDir Condition="'$(OptimumDir)' == ''">$(LOCALAPPDATA)\Programs\Optimum</OptimumDir>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>SparkLoad.Hook.Tests</AssemblyName>
+    <RootNamespace>SparkLoad.Hook.Tests</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>..\..\..\..\..\sparkload-build\out\hook-tests\</OutputPath>
+    <EventSourceSupport>true</EventSourceSupport>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.1.28" />
+    <PackageReference Include="Microsoft.Diagnostics.NETCore.Client" Version="0.2.661903" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- the hook under test, built by ..\SparkLoad.Hook.csproj (copied next to the harness) -->
+    <Reference Include="SparkLoad.Hook">
+      <HintPath>..\..\..\..\..\sparkload-build\out\hook\SparkLoad.Hook.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <!-- same 0Harmony the hook is compiled against; copied into the harness output only -->
+    <Reference Include="0Harmony">
+      <HintPath>$(OptimumDir)\Lib\0Harmony.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

@@ -35,7 +35,7 @@ public static class ReportBuilder
                 : AllocationReport.Disabled("allocation sampling was off for this capture (AllocationSampling false in SparkVS.json)");
             BundleWriter.WriteJson(Path.Combine(captureDir, "allocations.json"), alloc);
             File.WriteAllText(Path.Combine(captureDir, "summary.json"), HeadlineJson(report, alloc, captureDir));
-            File.WriteAllText(Path.Combine(captureDir, "summary.md"), SummaryWriter.ToMarkdown(report, true) + Environment.NewLine + AllocationReport.ToMarkdown(alloc) + Environment.NewLine + ExtraSections.Markdown(captureDir));
+            File.WriteAllText(Path.Combine(captureDir, "summary.md"), SummaryWriter.ToMarkdown(report, true) + Environment.NewLine + AllocationReport.ToMarkdown(alloc) + Environment.NewLine + ExtraSections.Markdown(captureDir, CaptureSide.IsServer(report.Side)));
             using (var fs = File.Create(Path.Combine(captureDir, "speedscope.json")))
                 Speedscope.Write(fs, set, report, report.Label);
             BundleWriter.AddStacksToFramesSummary(captureDir, report);
@@ -59,7 +59,7 @@ public static class ReportBuilder
     public static string HeadlineJson(Report r, JsonObject? alloc = null, string? captureDir = null)
     {
         var b = r.Bundle!;
-        var main = r.Threads.FirstOrDefault(t => t.Role == "client-main");
+        var main = Analyzer.FindMain(r);
         var topMods = new JsonArray();
         if (main != null)
             foreach (var g in main.ByMod.Take(8))
@@ -79,7 +79,7 @@ public static class ReportBuilder
                 ["frames"] = new JsonObject { ["label"] = "measured", ["detail_file"] = "frames-summary.json", ["data"] = JsonSerializer.SerializeToNode(b.Frames) },
                 ["tick"] = new JsonObject { ["label"] = "experimental", ["detail_file"] = "tick.jsonl", ["data"] = JsonSerializer.SerializeToNode(b.Tick) },
                 ["heap"] = new JsonObject { ["label"] = "measured", ["detail_file"] = "heap.jsonl", ["data"] = JsonSerializer.SerializeToNode(b.Heap) },
-                ["vram_dedicated"] = new JsonObject { ["label"] = "experimental", ["label_note"] = "stays experimental until the corrected gate (DXGI CurrentUsage vs PDH Local Usage, resident vs resident) passes in a live settled run. " + VramGate.Describe(b.Vram.VramGate), ["detail_file"] = "gpu-memory.jsonl", ["data"] = JsonSerializer.SerializeToNode(b.Vram) },
+                ["vram_dedicated"] = new JsonObject { ["label"] = "experimental", ["label_note"] = "stays experimental until the corrected gate (DXGI CurrentUsage vs PDH Local Usage, resident vs resident) passes in a live settled run. " + VramGate.Describe(b.Vram?.VramGate), ["detail_file"] = "gpu-memory.jsonl", ["data"] = JsonSerializer.SerializeToNode(b.Vram) },
                 ["cpu_sampling"] = new JsonObject
                 {
                     ["label"] = "estimated",
@@ -95,13 +95,35 @@ public static class ReportBuilder
         var sections = (JsonObject)node["sections"]!;
         var notCollected = new JsonArray();
         var reasons = new JsonObject();
+        bool server = CaptureSide.IsServer(r.Side);
+        if (server)
+        {
+            // A dedicated server has no frames, GPU or render phases: those sections and files are left out, not faked.
+            node["side"] = CaptureSide.Server;
+            sections.Remove("frames");
+            sections.Remove("vram_dedicated");
+            foreach (var file in CaptureSide.ClientOnlyFiles)
+            {
+                notCollected.Add(file);
+                reasons[file] = CaptureSide.ClientOnlyReason;
+            }
+        }
         if (alloc != null) AddSection(sections, notCollected, reasons, "allocations", "allocations.json", AllocationReport.Headline(alloc), alloc);
         if (captureDir != null)
         {
-            foreach (var (key, file) in new[] { ("chunk_pipeline", "chunk-pipeline.json"), ("patch_map", "patch-map.json"), ("asset_inventory", "asset-inventory.json"), ("vram_by_mod", "vram-by-mod.json"), ("gpu_phases", "gpu-phases.json") })
+            var extra = new[] { ("chunk_pipeline", "chunk-pipeline.json"), ("patch_map", "patch-map.json"), ("asset_inventory", "asset-inventory.json"), ("vram_by_mod", "vram-by-mod.json"), ("gpu_phases", "gpu-phases.json") };
+            if (server) extra = extra.Where(e => !CaptureSide.ClientOnlyFiles.Contains(e.Item2)).ToArray();
+            foreach (var (key, file) in extra)
             {
                 var doc = ExtraSections.Load(Path.Combine(captureDir, file));
                 AddSection(sections, notCollected, reasons, key, file, ExtraSections.Headline(file, doc), doc);
+            }
+            // gameevents.jsonl is a JSONL series, not a json document with an enabled flag, and it exists only when EventLog was on for the capture.
+            string eventsFile = Path.Combine(captureDir, EventLine.FileName);
+            if (File.Exists(eventsFile))
+            {
+                try { sections["game_events"] = EventSummary.FromJsonl(eventsFile).ToJson(); }
+                catch (Exception ex) { notCollected.Add(EventLine.FileName); reasons[EventLine.FileName] = "gameevents.jsonl could not be summarised: " + ex.Message; }
             }
         }
         if (captureDir != null) AddCensusAndEvents(captureDir, sections, notCollected, reasons);

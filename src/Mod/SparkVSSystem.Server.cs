@@ -54,7 +54,7 @@ public sealed partial class SparkVSSystem
             .EndSubCommand()
             .BeginSubCommand("status")
                 .WithDescription("Show server capture state")
-                .HandleWith(_ => TextCommandResult.Success($"SparkVS server capture {serverPhase}. Last: {(lastServerDir.Length > 0 ? lastServerDir : "none")}"));
+                .HandleWith(_ => TextCommandResult.Success($"SparkVS server capture {serverPhase}. Last: {(lastServerDir.Length > 0 ? lastServerDir : "none")}" + (state != State.Idle ? " | " + StatusText() : "")));
 
         // Headless runs: SPARKVS_SERVER_AUTOSTART=label;delaySec;durationSec starts a capture delaySec after the savegame loaded.
         var spec = Environment.GetEnvironmentVariable(ServerAutostartEnv);
@@ -76,12 +76,13 @@ public sealed partial class SparkVSSystem
         var api = sapi;
         if (api == null) return TextCommandResult.Error("Server not ready");
         if (serverPhase != ServerPhase.Idle) return TextCommandResult.Error("SparkVS server capture is already " + serverPhase);
+        if (state != State.Idle) return TextCommandResult.Error("SparkVS server capture is already " + state + " (started with /sparkvs start or SPARKVS_AUTOSTART)");
 
         int duration = Math.Clamp(seconds > 0 ? seconds : config.DefaultDurationSec, 1, config.MaxDurationSec);
         string root = config.BundleFolder.Length > 0 ? config.BundleFolder
             : config.OutputFolder.Length > 0 ? config.OutputFolder
             : Path.Combine(GamePaths.DataPath, "ModData", "sparkvs", "captures");
-        string name = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + "-server" + (requestedLabel.Length > 0 ? "-" + Sanitize(requestedLabel) : "");
+        string name = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + "-server" + (requestedLabel.Length > 0 ? "-" + CapturePaths.Sanitize(requestedLabel) : "");
         try
         {
             serverDir = Path.Combine(root, name);
@@ -125,7 +126,7 @@ public sealed partial class SparkVSSystem
 
     TextCommandResult OnServerStop()
     {
-        if (serverPhase != ServerPhase.Running) return TextCommandResult.Error("SparkVS server capture is not running");
+        if (serverPhase != ServerPhase.Running) return state != State.Idle ? OnStop() : TextCommandResult.Error("SparkVS server capture is not running");
         FinishServerCapture();
         return TextCommandResult.Success("SparkVS: stopping the server capture, files are written in the background.");
     }

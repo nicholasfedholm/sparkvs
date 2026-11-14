@@ -9,6 +9,9 @@ namespace SparkVS.Core;
 /// </summary>
 public sealed class TickLog
 {
+    /// <summary>Recorded as mspt when only the tick period is known (no per tick work time source). Written as null.</summary>
+    public const int NoMspt = -1;
+
     readonly object gate = new();
     readonly long[] stamp;
     readonly int[] msptMs;

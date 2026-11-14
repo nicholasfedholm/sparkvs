@@ -1020,6 +1020,378 @@ MemoryEngineTests.Run(Check);
 }
 // ===== END capture-fixes worker C tests =====
 
+// ---------------------------------------------------------------- dedicated server parity (0.4.0)
+{
+    // SPARKVS_AUTOSTART parsing, shared by the client and the server path
+    Check("autostart blank is none", AutostartSpec.TryParse(null, out _) == AutostartOutcome.None && AutostartSpec.TryParse("  ", out _) == AutostartOutcome.None);
+    Check("autostart basic", AutostartSpec.TryParse("lbl;5;60", out var spA) == AutostartOutcome.Ok && spA!.Label == "lbl" && spA.DelaySeconds == 5 && spA.DurationSeconds == 60 && spA.Mark == null && !spA.Bundle && !spA.Report);
+    Check("autostart report flag", AutostartSpec.TryParse("lbl;5;60;report", out var spB) == AutostartOutcome.Ok && spB!.Report && !spB.Bundle);
+    Check("autostart bundle implies report", AutostartSpec.TryParse("lbl;5;60;bundle", out var spC) == AutostartOutcome.Ok && spC!.Bundle && spC.Report);
+    Check("autostart flag list with spaces and unknown flag", AutostartSpec.TryParse("lbl;5;60; report , bundle ,nonsense", out var spD) == AutostartOutcome.Ok && spD!.Bundle && spD.Report);
+    Check("autostart mark delay", AutostartSpec.TryParse("lbl;mark:go now;30;bundle", out var spE) == AutostartOutcome.Ok && spE!.Mark == "go now" && spE.DelaySeconds == 0 && spE.DurationSeconds == 30 && spE.Bundle);
+    Check("autostart malformed", AutostartSpec.TryParse("x", out _) == AutostartOutcome.Malformed
+        && AutostartSpec.TryParse("a;b;c", out _) == AutostartOutcome.Malformed
+        && AutostartSpec.TryParse("a;5;x", out _) == AutostartOutcome.Malformed
+        && AutostartSpec.TryParse("a;mark:x", out _) == AutostartOutcome.Malformed);
+
+    // Output folders: the same rule for both sides, rooted at the data path
+    string spData = Path.Combine(Path.GetTempPath(), "vsdata");
+    Check("root plain default", CapturePaths.Root("", "", false, spData) == Path.Combine(spData, "ModData", "sparkvs"));
+    Check("root bundle default has captures subfolder", CapturePaths.Root("", "", true, spData) == Path.Combine(spData, "ModData", "sparkvs", "captures"));
+    Check("root output folder wins for plain and bundle without bundle folder", CapturePaths.Root("", "out", false, spData) == "out" && CapturePaths.Root("", "out", true, spData) == "out");
+    Check("root bundle folder only for bundles", CapturePaths.Root("b", "out", true, spData) == "b" && CapturePaths.Root("b", "out", false, spData) == "out" && CapturePaths.Root("b", "", false, spData) == Path.Combine(spData, "ModData", "sparkvs"));
+    var spNow = new DateTime(2026, 11, 11, 10, 15, 30);
+    Check("capture name", CapturePaths.CaptureName(spNow, "") == "20261111-101530" && CapturePaths.CaptureName(spNow, "my label/1") == "20261111-101530-my_label_1");
+    Check("memory dir", CapturePaths.MemoryDir(spData, spNow) == Path.Combine(spData, "ModData", "sparkvs", "memory-20261111-101530"));
+    Check("asset inventory dir", CapturePaths.AssetInventoryDir("", spData) == Path.Combine(spData, "ModData", "sparkvs", "asset-inventory") && CapturePaths.AssetInventoryDir("x", spData) == "x");
+
+    // Side selection: only a dedicated server without a client instance in the process captures on the server side
+    Check("server capture active only when dedicated and no client", CaptureSide.ServerCaptureActive(true, false)
+        && !CaptureSide.ServerCaptureActive(true, true) && !CaptureSide.ServerCaptureActive(false, false) && !CaptureSide.ServerCaptureActive(false, true));
+    Check("main role by side", CaptureSide.MainRole(null) == "client-main" && CaptureSide.MainRole("client") == "client-main" && CaptureSide.MainRole("server") == "server-main");
+    Check("client only file list", CaptureSide.ClientOnlyFiles.Contains("frames.jsonl") && CaptureSide.ClientOnlyFiles.Contains("gpu-memory.jsonl") && !CaptureSide.ServerWriterFiles.Contains("gpu-phases.json"));
+
+    // The autostart guard fires once, even from many threads
+    var spOnce = new OnceFlag();
+    int spFires = 0;
+    var spThreads = Enumerable.Range(0, 8).Select(_ => new Thread(() => { if (spOnce.TryFire()) Interlocked.Increment(ref spFires); })).ToList();
+    spThreads.ForEach(x => x.Start());
+    spThreads.ForEach(x => x.Join());
+    Check("once flag fires once", spFires == 1 && spOnce.HasFired && !spOnce.TryFire());
+
+    // Tick view on a dedicated server: work time and tick period, or period only when the work time source is missing
+    string spDir = Path.Combine(Path.GetTempPath(), "sparkvs-srv-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(spDir);
+    var spClock = BundleClock.FromStamp(Stopwatch.GetTimestamp());
+    long spMs = Stopwatch.Frequency / 1000;
+    var spTicks = new TickLog(64);
+    spTicks.Begin();
+    for (int i = 1; i <= 40; i++) spTicks.Record(i * 50 * spMs, 4 + i % 3);
+    spTicks.End();
+    var spStats = BundleWriter.WriteTick(spDir, spTicks, spClock, null, true);
+    var spHeader = JsonDocument.Parse(File.ReadLines(Path.Combine(spDir, "tick.jsonl")).First()).RootElement;
+    Check("server tick stats", spStats.Enabled && spStats.TickCount == 40 && spStats.MsptSource == "ServerMain.StatsCollector tickTimes" && spStats.MeanMsptMs >= 4 && spStats.MaxMsptMs <= 6);
+    Near("server tick rate is 20 TPS for a 50 ms period", spStats.MeanTps ?? 0, 20, 0.05);
+    Check("server tick interval percentiles", Math.Abs((spStats.P95IntervalMs ?? 0) - 50) < 0.5 && Math.Abs((spStats.MaxIntervalMs ?? 0) - 50) < 0.5);
+    Check("server tick header names the side", spHeader.GetProperty("side").GetString() == "server" && spHeader.GetProperty("description").GetString()!.Contains("Dedicated server"));
+
+    var spNoMspt = new TickLog(16);
+    spNoMspt.Begin();
+    for (int i = 1; i <= 10; i++) spNoMspt.Record(i * 25 * spMs, TickLog.NoMspt);
+    spNoMspt.End();
+    string spDir2 = Path.Combine(spDir, "nomspt");
+    Directory.CreateDirectory(spDir2);
+    var spStats2 = BundleWriter.WriteTick(spDir2, spNoMspt, spClock, "StatsCollector missing", true);
+    var spRows = File.ReadAllLines(Path.Combine(spDir2, "tick.jsonl"));
+    Check("period only tick stats", spStats2.Enabled && spStats2.MsptSource!.StartsWith("unavailable") && spStats2.Reason == "StatsCollector missing" && spStats2.MaxMsptMs == 0);
+    Near("period only tick rate is 40 TPS for 25 ms", spStats2.MeanTps ?? 0, 40, 0.1);
+    Check("period only rows carry null mspt", JsonDocument.Parse(spRows[2]).RootElement.GetProperty("mspt_ms").ValueKind == JsonValueKind.Null && spRows[0].Contains("unavailable"));
+
+    // The client tick output is unchanged: no server-only keys
+    var spClientTick = BundleWriter.WriteTick(spDir, spTicks, spClock, null);
+    string spClientJson = JsonSerializer.Serialize(spClientTick);
+    Check("client tick stats have no server keys", spClientTick.MeanTps == null && !spClientJson.Contains("mean_tps") && !spClientJson.Contains("mspt_source"));
+
+    // Reports on the server side: role, scope, no frame or VRAM sections, client-only files named as not collected
+    var spSet = new SampleSet();
+    spSet.Frames.Add(new FrameInfo { Method = "Vintagestory.Server.ServerMain.Process()", Module = "VintagestoryLib" });
+    spSet.Frames.Add(new FrameInfo { Method = "ModA.Tick()", Module = "ModAsm" });
+    spSet.Stacks.Add(new[] { 1, 0 });
+    for (int i = 0; i < 10; i++) spSet.Samples.Add(new Sample { ThreadId = 7, TimeMs = i * 10, StackId = 0 });
+    CaptureMeta SpMeta(int mainId) => new()
+    {
+        Label = "srv", Side = "server", StartQpc = 0, EndQpc = Stopwatch.Frequency / 10, QpcFrequency = Stopwatch.Frequency,
+        MainThreadOsId = mainId, ServerThreadOsId = mainId, AssemblyToMod = new() { ["ModAsm"] = "moda" }, GameAssemblies = new() { "VintagestoryLib" },
+        Bundle = new BundleSummary { StartLocal = "t", SparkVsVersion = "test", Side = "server", Frames = null, Vram = null, Tick = spStats, Heap = new HeapStats { Enabled = true, Samples = 3 } },
+    };
+    var spReport = Analyzer.Build(spSet, SpMeta(7));
+    Check("server report main role", spReport.Side == "server" && spReport.Threads[0].Role == "server-main" && spReport.MainThreadSamples == 10 && spReport.ScopeNote.StartsWith("Dedicated server"));
+    var spReportUnknownId = Analyzer.Build(spSet, SpMeta(0));
+    Check("server main thread found by its ServerMain stack when the id is unknown", spReportUnknownId.MainThreadSamples == 10 && Analyzer.FindMain(spReportUnknownId)?.Role == "server");
+    string spMd = SummaryWriter.ToMarkdown(spReport, true);
+    Check("server markdown has no client sections", !spMd.Contains("## Frames") && !spMd.Contains("VRAM") && !spMd.Contains("Fps in the seconds") && spMd.Contains("## Server main thread: top 15 methods") && spMd.Contains("Server tick, dedicated server") && spMd.Contains("Client only, omitted from a server bundle"));
+    Check("server markdown tick rate line", spMd.Contains("Tick rate: 20.00 TPS"), spMd);
+    var spHead = JsonDocument.Parse(ReportBuilder.HeadlineJson(spReport, AllocationReport.Disabled("x"), spDir)).RootElement;
+    var spSections = spHead.GetProperty("sections");
+    var spNc = spHead.GetProperty("not_collected").EnumerateArray().Select(e => e.GetString()).ToList();
+    Check("server headline omits frames and vram sections", !spSections.TryGetProperty("frames", out _) && !spSections.TryGetProperty("vram_dedicated", out _) && spSections.TryGetProperty("tick", out _) && spSections.TryGetProperty("heap", out _) && spHead.GetProperty("side").GetString() == "server");
+    Check("server headline names client only files", CaptureSide.ClientOnlyFiles.All(f => spNc.Contains(f)) && spHead.GetProperty("not_collected_reasons").GetProperty("frames.jsonl").GetString()!.StartsWith("client only"));
+    Check("server top owners come from the server main thread", spSections.GetProperty("cpu_sampling").GetProperty("main_thread_samples").GetInt32() == 10);
+    string spCpuJson = SummaryWriter.ToJson(spReport);
+    Check("server cpu summary has no frames or vram bundle blocks", !spCpuJson.Contains("\"frames\"") && !spCpuJson.Contains("\"vram\"") && spCpuJson.Contains("\"side\": \"server\""));
+    string spDir3 = Path.Combine(spDir, "ph");
+    Directory.CreateDirectory(spDir3);
+    BundleWriter.WritePlaceholdersForMissing(spDir3, "r", CaptureSide.ServerWriterFiles);
+    Check("server placeholders written for server files only", File.Exists(Path.Combine(spDir3, "allocations.json")) && File.Exists(Path.Combine(spDir3, "chunk-pipeline.json")) && !File.Exists(Path.Combine(spDir3, "gpu-phases.json")));
+    BundleWriter.WriteJson(Path.Combine(spDir3, "chunk-pipeline.json"), new JsonObject { ["enabled"] = false, ["reason"] = "x" });
+    Check("server extra markdown has no gpu section", ExtraSections.Markdown(spDir3, true).Length < ExtraSections.Markdown(spDir3, false).Length);
+
+    // The client capture files do not change: no side key anywhere unless the capture was on a server
+    var spClientMeta = new CaptureMeta { Label = "c", Bundle = new BundleSummary() };
+    string spClientMetaJson = JsonSerializer.Serialize(spClientMeta);
+    Check("client meta and bundle have no side key", !spClientMetaJson.Contains("\"Side\"") && !spClientMetaJson.Contains("\"side\"") && spClientMetaJson.Contains("\"frames\"") && spClientMetaJson.Contains("\"vram\""));
+    var spServerMetaJson = JsonSerializer.Serialize(SpMeta(7));
+    var spMetaBack = JsonSerializer.Deserialize<CaptureMeta>(spServerMetaJson)!;
+    Check("server meta round trips with its side", spMetaBack.Side == "server" && spMetaBack.Bundle!.Side == "server" && !spServerMetaJson.Contains("\"frames\"") && !spServerMetaJson.Contains("\"vram\""));
+    Check("client report json has no side key", !SummaryWriter.ToJson(Analyzer.Build(set, new CaptureMeta { MainThreadOsId = 1, QpcFrequency = Stopwatch.Frequency, EndQpc = Stopwatch.Frequency })).Contains("\"side\""));
+
+    try { Directory.Delete(spDir, true); } catch { }
+}
+
+// EventStream module: modes, row format, clock alignment, sinks, re-entrancy, summary, wiring into the bundle files
+{
+    EventStreamHub.Reset();
+    string evDir = Path.Combine(Path.GetTempPath(), "sparkvs-ev-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(evDir);
+    string[] EvReadLines(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var sr0 = new StreamReader(fs);
+        var all = new List<string>();
+        string? ln;
+        while ((ln = sr0.ReadLine()) != null) all.Add(ln);
+        return all.ToArray();
+    }
+    var evClock = new BundleClock(1000, new DateTime(2026, 11, 13, 12, 0, 0, DateTimeKind.Local), 1000);   // 1 kHz counter, origin at stamp 1000
+
+    // Modes and policy
+    bool evValid;
+    Check("mode parse off", EventStreamModes.Parse("off", out evValid) == EventStreamMode.Off && evValid);
+    Check("mode parse is case and space insensitive", EventStreamModes.Parse(" ALWAYS ", out evValid) == EventStreamMode.Always && evValid);
+    Check("mode parse capture", EventStreamModes.Parse("capture", out evValid) == EventStreamMode.Capture && evValid);
+    Check("mode parse null is the default and valid", EventStreamModes.Parse(null, out evValid) == EventStreamMode.Capture && evValid);
+    Check("mode parse unknown falls back to capture and is flagged", EventStreamModes.Parse("bogus", out evValid) == EventStreamMode.Capture && !evValid);
+    Check("mode parse empty is flagged", EventStreamModes.Parse("", out evValid) == EventStreamMode.Capture && !evValid);
+    Check("mode names round trip", new[] { EventStreamMode.Off, EventStreamMode.Capture, EventStreamMode.Always }.All(m => EventStreamModes.Parse(EventStreamModes.Name(m), out _) == m));
+    Check("policy subscribe", !EventStreamPolicy.Subscribe(EventStreamMode.Off) && EventStreamPolicy.Subscribe(EventStreamMode.Capture) && EventStreamPolicy.Subscribe(EventStreamMode.Always));
+    Check("policy patch hurt", !EventStreamPolicy.PatchHurt(EventStreamMode.Off, true) && !EventStreamPolicy.PatchHurt(EventStreamMode.Capture, false) && EventStreamPolicy.PatchHurt(EventStreamMode.Capture, true) && EventStreamPolicy.PatchHurt(EventStreamMode.Always, true) && !EventStreamPolicy.PatchHurt(EventStreamMode.Always, false));
+    Check("policy session file only in always", !EventStreamPolicy.SessionFile(EventStreamMode.Off) && !EventStreamPolicy.SessionFile(EventStreamMode.Capture) && EventStreamPolicy.SessionFile(EventStreamMode.Always));
+    Check("session path follows plain captures: data path default", EventStreamPaths.SessionFile("", "D:\\data", new DateTime(2026, 11, 13, 12, 0, 5)) == Path.Combine("D:\\data", "ModData", "sparkvs", "events", "events-20261113-120005.jsonl"));
+    Check("session path follows plain captures: output folder", EventStreamPaths.SessionFile("X:\\out", "D:\\data", new DateTime(2026, 11, 13, 12, 0, 5)) == Path.Combine("X:\\out", "events", "events-20261113-120005.jsonl"));
+
+    // Row format
+    var evFull = new EventRow
+    {
+        Type = EventRow.Hurt,
+        Entity = new EventEntity("game:wolf-\"male\"", 42, "game", "Wolf \\ <male>\n\u00e9"),
+        Pos = new[] { 1.54, 2, -3.21 },
+        Source = "Entity", DmgType = "PiercingAttack", Damage = 4.567,
+        Attacker = new EventAttacker("game:player", 7),
+    };
+    string evLine = EventLine.Build(evFull, 12.34567, "2026-11-13T12:00:00.012+00:00");
+    using (var evDoc = JsonDocument.Parse(evLine))
+    {
+        var r = evDoc.RootElement;
+        Check("row t_ms three decimals", evLine.Contains("\"t_ms\":12.346,"), evLine);
+        Check("row type and side", r.GetProperty("type").GetString() == "hurt" && r.GetProperty("side").GetString() == "server");
+        Check("row entity fields", r.GetProperty("entity").GetProperty("code").GetString() == "game:wolf-\"male\"" && r.GetProperty("entity").GetProperty("id").GetInt64() == 42 && r.GetProperty("entity").GetProperty("domain").GetString() == "game");
+        Check("row escaping round trips", r.GetProperty("entity").GetProperty("name").GetString() == "Wolf \\ <male>\n\u00e9");
+        Check("row pos one decimal", evLine.Contains("\"pos\":[1.5,2.0,-3.2]"), evLine);
+        Check("row damage two decimals", evLine.Contains("\"damage\":4.57"), evLine);
+        Check("row source dmg_type attacker", r.GetProperty("source").GetString() == "Entity" && r.GetProperty("dmg_type").GetString() == "PiercingAttack" && r.GetProperty("attacker").GetProperty("id").GetInt64() == 7 && r.GetProperty("attacker").GetProperty("code").GetString() == "game:player");
+        Check("row without applicable fields omits them", !r.TryGetProperty("level", out _) && !r.TryGetProperty("message", out _) && !r.TryGetProperty("player", out _) && !r.TryGetProperty("reason", out _));
+    }
+    string evNote = EventLine.Build(new EventRow { Type = EventRow.Note, Player = "console", Text = "hello" }, 1, "x");
+    Check("note row omits entity pos damage attacker", !evNote.Contains("\"entity\"") && !evNote.Contains("\"pos\"") && !evNote.Contains("\"damage\"") && !evNote.Contains("\"attacker\"") && evNote.Contains("\"player\":\"console\"") && evNote.Contains("\"text\":\"hello\""), evNote);
+    string evBadNum = EventLine.Build(new EventRow { Type = EventRow.Hurt, Damage = double.NaN, Pos = new[] { double.NaN, 0, 0 } }, 0, "x");
+    Check("non finite numbers are left out so the line stays valid json", !evBadNum.Contains("NaN") && JsonDocument.Parse(evBadNum).RootElement.GetProperty("type").GetString() == "hurt", evBadNum);
+    var evOldCulture = System.Globalization.CultureInfo.CurrentCulture;
+    try
+    {
+        System.Globalization.CultureInfo.CurrentCulture = new System.Globalization.CultureInfo("de-DE");
+        string deLine = EventLine.Build(new EventRow { Type = EventRow.Hurt, Damage = 1.5, Pos = new[] { 1.5, 2.5, 3.5 } }, 0.5, "x");
+        Check("invariant decimals under a comma culture", deLine.Contains("\"damage\":1.50") && deLine.Contains("\"t_ms\":0.500") && JsonDocument.Parse(deLine).RootElement.GetProperty("damage").GetDouble() == 1.5, deLine);
+    }
+    finally { System.Globalization.CultureInfo.CurrentCulture = evOldCulture; }
+    var evLogRow = EventLine.Build(new EventRow { Type = EventRow.Log, Level = "warning", Message = "bad {0} \"x\"" }, 0, "x");
+    Check("log row has level and message", JsonDocument.Parse(evLogRow).RootElement.GetProperty("message").GetString() == "bad {0} \"x\"" && evLogRow.Contains("\"level\":\"warning\""));
+
+    // Chat classification
+    var evCmd = EventRow.FromChat("Nick", "/tp 100 64 100 secret");
+    Check("slash line is a command row with the first token only", evCmd != null && evCmd.Type == "command" && evCmd.Text == "/tp" && evCmd.Player == "Nick");
+    Check("bare command keeps itself", EventRow.FromChat("Nick", "/time")?.Text == "/time");
+    var evChat = EventRow.FromChat("Nick", "hello there");
+    Check("plain line is a chat row", evChat != null && evChat.Type == "chat" && evChat.Text == "hello there");
+    Check("blank chat is skipped", EventRow.FromChat("Nick", "   ") == null && EventRow.FromChat("Nick", null) == null);
+    Check("chat without a player name gets a placeholder", EventRow.FromChat(null, "hi")?.Player == "?");
+
+    // Mode gating: nothing open, nothing written
+    Check("record with no sinks does nothing", EventStreamHub.Record(new EventRow { Type = EventRow.Spawn }, 2000) == 0 && !EventStreamHub.Active);
+    string evNone = Path.Combine(evDir, "none");
+    Directory.CreateDirectory(evNone);
+    Check("end capture without begin writes no file and returns 0", EventStreamHub.EndCapture(evNone) == 0 && !File.Exists(Path.Combine(evNone, "gameevents.jsonl")));
+    Check("hub starts detached", !EventStreamHub.Attached && !EventStreamHub.CaptureOpen && !EventStreamHub.SessionOpen);
+
+    // Capture sink: file layout and clock alignment
+    EventStreamHub.BeginCapture(evClock);
+    Check("capture open makes the hub active", EventStreamHub.Active && EventStreamHub.CaptureOpen);
+    long[] evStamps = { 1000, 1500, 2345, 61000 };
+    for (int i = 0; i < evStamps.Length; i++)
+        EventStreamHub.Record(new EventRow { Type = i % 2 == 0 ? EventRow.Spawn : EventRow.Death, Entity = new EventEntity("game:wolf-male", 100 + i, "game", "Wolf"), Pos = new[] { 1.0, 2.0, 3.0 } }, evStamps[i]);
+    string evCapDir = Path.Combine(evDir, "cap");
+    Directory.CreateDirectory(evCapDir);
+    int evWritten = EventStreamHub.EndCapture(evCapDir);
+    string evFile = Path.Combine(evCapDir, "gameevents.jsonl");
+    var evLines = File.ReadAllLines(evFile);
+    Check("end capture returns the row count and writes the file", evWritten == 4 && File.Exists(evFile) && evLines.Length == 6, evLines.Length.ToString());
+    Check("capture closed after end", !EventStreamHub.Active);
+    using (var h = JsonDocument.Parse(evLines[0]))
+        Check("first line is the game_events header", h.RootElement.GetProperty("type").GetString() == "header" && h.RootElement.GetProperty("series").GetString() == "game_events" && h.RootElement.GetProperty("start_qpc").GetInt64() == 1000 && h.RootElement.GetProperty("qpc_frequency_hz").GetInt64() == 1000 && h.RootElement.GetProperty("start_local").GetString() == evClock.StartIso);
+    using (var f = JsonDocument.Parse(evLines[^1]))
+        Check("last line is the footer", f.RootElement.GetProperty("type").GetString() == "footer" && f.RootElement.GetProperty("rows").GetInt32() == 4 && f.RootElement.GetProperty("dropped").GetInt32() == 0);
+    bool evAligned = true;
+    for (int i = 0; i < evStamps.Length; i++)
+    {
+        using var rd = JsonDocument.Parse(evLines[i + 1]);
+        double want = evClock.MsSince(evStamps[i]);
+        evAligned &= Math.Abs(rd.RootElement.GetProperty("t_ms").GetDouble() - want) < 0.0006 && rd.RootElement.GetProperty("ts_local").GetString() == evClock.IsoAt(want);
+    }
+    Check("t_ms equals MsSince(qpc) and ts_local equals IsoAt for every row", evAligned);
+    Near("row at the clock origin is 0 ms", evClock.MsSince(1000), 0);
+    using (var r2 = JsonDocument.Parse(evLines[3]))
+        Near("1345 counts at 1 kHz is 1345 ms", r2.RootElement.GetProperty("t_ms").GetDouble(), 1345.0);
+
+    // Two sinks at once, session file written row by row
+    string evSession = Path.Combine(evDir, "sess", "events-test.jsonl");
+    var evSessClock = new BundleClock(5000, new DateTime(2026, 11, 13, 13, 0, 0, DateTimeKind.Local), 1000);
+    Check("start session opens the file", EventStreamHub.StartSession(evSession, evSessClock) && File.Exists(evSession) && EventStreamHub.SessionOpen && EventStreamHub.SessionPath == evSession);
+    Check("second session start is refused", !EventStreamHub.StartSession(Path.Combine(evDir, "sess", "second.jsonl"), evSessClock));
+    EventStreamHub.BeginCapture(evClock);
+    Check("one record reaches both sinks", EventStreamHub.Record(new EventRow { Type = EventRow.Spawn, Entity = new EventEntity("game:a", 1, "game", "A") }, 5100) == 2);
+    var evLive = EventSummary.FromJsonl(evSession);   // file still open: rows are already on disk
+    Check("session rows are flushed per row", evLive.Rows == 1 && evLive.ByType["spawn"] == 1);
+    using (var sr = JsonDocument.Parse(EvReadLines(evSession)[1]))
+        Check("session rows use the session clock", Math.Abs(sr.RootElement.GetProperty("t_ms").GetDouble() - 100.0) < 0.0006 && sr.RootElement.GetProperty("ts_local").GetString() == evSessClock.IsoAt(100.0));
+    string evBothDir = Path.Combine(evDir, "both");
+    Directory.CreateDirectory(evBothDir);
+    EventStreamHub.EndCapture(evBothDir);
+    using (var cr = JsonDocument.Parse(File.ReadAllLines(Path.Combine(evBothDir, "gameevents.jsonl"))[1]))
+        Check("capture copy uses the capture clock, not the session clock", Math.Abs(cr.RootElement.GetProperty("t_ms").GetDouble() - 4100.0) < 0.0006 && cr.RootElement.GetProperty("ts_local").GetString() == evClock.IsoAt(4100.0));
+    Check("session stays open after the capture ended", EventStreamHub.SessionOpen && EventStreamHub.Active);
+    int evSessRows = EventStreamHub.StopSession();
+    var evSessLines = EvReadLines(evSession);
+    Check("stop session returns rows and writes the footer", evSessRows == 1 && evSessLines.Length == 3 && evSessLines[^1].Contains("\"type\":\"footer\"") && evSessLines[^1].Contains("\"rows\":1"));
+    Check("stop session twice is -1 and the hub is idle", EventStreamHub.StopSession() == -1 && !EventStreamHub.Active);
+
+    // Cap and dropped
+    Check("row cap is 200000", EventStreamSink.RowCap == 200_000);
+    var evSmall = new EventStreamSink(evClock, null, 3);
+    int evAccepted = 0;
+    for (int i = 0; i < 5; i++) if (evSmall.Add(new EventRow { Type = EventRow.Spawn }, 1000 + i)) evAccepted++;
+    Check("cap keeps the first rows and counts the rest as dropped", evAccepted == 3 && evSmall.Rows == 3 && evSmall.Dropped == 2 && evSmall.Lines().Count == 3);
+    string evCapFile = Path.Combine(evDir, "capped.jsonl");
+    Check("capture sink footer carries rows and dropped", evSmall.WriteCapture(evCapFile) == 3 && File.ReadAllLines(evCapFile)[^1] == "{\"type\":\"footer\",\"rows\":3,\"dropped\":2}");
+    Check("summary reads the dropped count from the footer", EventSummary.FromJsonl(evCapFile).Dropped == 2 && EventSummary.FromJsonl(evCapFile).Rows == 3);
+    Check("closed sink takes nothing", !evSmall.Add(new EventRow { Type = EventRow.Spawn }, 1000));
+
+    // Re-entrancy guard
+    EventStreamHub.Reset();
+    EventStreamHub.BeginCapture(evClock);
+    EventStreamHub.Probe = row => { if (row.Message == "outer") EventStreamHub.Record(new EventRow { Type = EventRow.Log, Level = "warning", Message = "inner" }, 1100); };
+    int evOuter = EventStreamHub.Record(new EventRow { Type = EventRow.Log, Level = "error", Message = "outer" }, 1050);
+    EventStreamHub.Probe = null;
+    Check("a record made while recording is ignored", evOuter == 1 && EventStreamHub.Status().Contains("1 rows"), EventStreamHub.Status());
+    Check("the guard resets afterwards", EventStreamHub.Record(new EventRow { Type = EventRow.Log, Level = "warning", Message = "after" }, 1200) == 1 && EventStreamHub.Status().Contains("2 rows"));
+    bool evOtherThread = false;
+    EventStreamHub.Probe = row =>
+    {
+        if (row.Message != "trigger") return;
+        // another thread is not inside Record, so this thread's guard does not block it
+        var th = new Thread(() => evOtherThread = EventStreamHub.Record(new EventRow { Type = EventRow.Log, Message = "other" }, 1300) == 1);
+        th.Start(); th.Join();
+    };
+    EventStreamHub.Record(new EventRow { Type = EventRow.Log, Message = "trigger" }, 1250);
+    EventStreamHub.Probe = null;
+    Check("the guard is per thread", evOtherThread);
+    EventStreamHub.Reset();
+
+    // Commands and their reply texts
+    var evOff = EventStreamCommands.Start(EventStreamMode.Off, () => "unused");
+    Check("off start says it is off", !evOff.Ok && evOff.Text == EventStreamCommands.OffMessage && evOff.Text.Contains("off in SparkVS.json"));
+    Check("off stop and note say it is off", EventStreamCommands.Stop(EventStreamMode.Off).Text == EventStreamCommands.OffMessage && EventStreamCommands.Note(EventStreamMode.Off, "x", "y", 1).Text == EventStreamCommands.OffMessage);
+    var evCapStart = EventStreamCommands.Start(EventStreamMode.Capture, () => "unused");
+    Check("capture start is a no-op with the bound message", evCapStart.Ok && evCapStart.Text.Contains("event logging is bound to SparkVS captures (.sparkvs start / /sparkvs start)") && !EventStreamHub.Active);
+    Check("capture stop is a no-op with the bound message", EventStreamCommands.Stop(EventStreamMode.Capture).Text.Contains(EventStreamCommands.BoundMessage));
+    var evStatusCap = EventStreamCommands.Status(EventStreamMode.Capture, true, false);
+    Check("status names mode, hurt state, sinks and the binding", evStatusCap.Text.Contains("mode capture") && evStatusCap.Text.Contains("HurtLog on, hurt patch not live") && evStatusCap.Text.Contains("no sink open") && evStatusCap.Text.Contains(EventStreamCommands.BoundMessage), evStatusCap.Text);
+    Check("status in always mode has no binding sentence", !EventStreamCommands.Status(EventStreamMode.Always, false, false).Text.Contains(EventStreamCommands.BoundMessage) && EventStreamCommands.Status(EventStreamMode.Always, false, true).Text.Contains("HurtLog off, hurt patch live"));
+    var evNoteNone = EventStreamCommands.Note(EventStreamMode.Capture, "x", "y", 1);
+    Check("note with nothing open is not recorded", !evNoteNone.Ok && evNoteNone.Text.Contains("not recorded: no capture or session open"));
+    string evCmdSession = Path.Combine(evDir, "cmd", "events-cmd.jsonl");
+    var evStart = EventStreamCommands.Start(EventStreamMode.Always, () => evCmdSession);
+    Check("always start opens the session", evStart.Ok && evStart.Text.Contains(evCmdSession) && EventStreamHub.SessionOpen);
+    Check("always start twice is refused", !EventStreamCommands.Start(EventStreamMode.Always, () => Path.Combine(evDir, "cmd", "again.jsonl")).Ok);
+    string evCmdText = EventStreamCommands.Note(EventStreamMode.Always, null, "marker one", Stopwatch.GetTimestamp()).Ok ? string.Join("|", EvReadLines(evCmdSession)) : "";
+    Check("note goes into the session with a console author", evCmdText.Contains("\"player\":\"console\"") && evCmdText.Contains("marker one"), evCmdText);
+    var evStop = EventStreamCommands.Stop(EventStreamMode.Always);
+    Check("always stop reports the rows", evStop.Ok && evStop.Text.Contains("1 rows") && !EventStreamHub.Active, evStop.Text);
+    Check("always stop with no session is an error", !EventStreamCommands.Stop(EventStreamMode.Always).Ok);
+    EventStreamHub.Reset();
+
+    // Summary
+    EventStreamHub.BeginCapture(evClock);
+    void EvRow(string type, string code, long stamp) => EventStreamHub.Record(new EventRow { Type = type, Entity = new EventEntity(code, 1, "game", "n") }, stamp);
+    for (int i = 0; i < 3; i++) EvRow(EventRow.Hurt, "game:wolf-male", 2000 + i);
+    EvRow(EventRow.Hurt, "game:drifter-normal", 2010);
+    for (int i = 0; i < 2; i++) EvRow(EventRow.Hurt, "game:bear", 2020 + i);
+    for (int i = 0; i < 2; i++) EvRow(EventRow.Death, "game:drifter-normal", 3000 + i);
+    EvRow(EventRow.Death, "game:wolf-male", 3010);
+    EvRow(EventRow.Spawn, "game:chicken", 1500);
+    EventStreamHub.Record(new EventRow { Type = EventRow.Log, Level = "error", Message = "boom" }, 4000);
+    string evSumDir = Path.Combine(evDir, "sum");
+    Directory.CreateDirectory(evSumDir);
+    EventStreamHub.EndCapture(evSumDir);
+    var evSum = EventSummary.FromJsonl(Path.Combine(evSumDir, "gameevents.jsonl"));
+    Check("summary rows and types", evSum.Rows == 11 && evSum.ByType["hurt"] == 6 && evSum.ByType["death"] == 3 && evSum.ByType["spawn"] == 1 && evSum.ByType["log"] == 1 && evSum.Dropped == 0, string.Join(",", evSum.ByType));
+    Check("top hurts ordered by count then code", evSum.TopHurts.Select(kv => kv.Key + "=" + kv.Value).SequenceEqual(new[] { "game:wolf-male=3", "game:bear=2", "game:drifter-normal=1" }), string.Join(",", evSum.TopHurts));
+    Check("top deaths ordered by count", evSum.TopDeaths.Select(kv => kv.Key + "=" + kv.Value).SequenceEqual(new[] { "game:drifter-normal=2", "game:wolf-male=1" }), string.Join(",", evSum.TopDeaths));
+    Near("first t_ms", evSum.FirstMs ?? -1, 500);
+    Near("last t_ms", evSum.LastMs ?? -1, 3000);
+    string evMd = evSum.Markdown();
+    Check("markdown heading is exactly ## Game events at the start", evMd.StartsWith("## Game events\r\n") || evMd.StartsWith("## Game events\n"), evMd);
+    Check("markdown carries types and tops", evMd.Contains("| hurt | 6 |") && evMd.Contains("| game:wolf-male | 3 |") && evMd.Contains("Top entities by deaths"));
+    var evJson = evSum.ToJson();
+    Check("summary json shape", evJson["rows"]!.GetValue<int>() == 11 && evJson["by_type"]!["hurt"]!.GetValue<int>() == 6 && evJson["top_hurts"]![0]!["entity"]!.GetValue<string>() == "game:wolf-male" && evJson["detail_file"]!.GetValue<string>() == "gameevents.jsonl" && evJson["dropped"]!.GetValue<int>() == 0);
+    EventStreamHub.BeginCapture(evClock);
+    for (int i = 0; i < 14; i++) EvRow(EventRow.Hurt, "game:e" + i.ToString("00"), 2000 + i);
+    string evTopDir = Path.Combine(evDir, "top");
+    Directory.CreateDirectory(evTopDir);
+    EventStreamHub.EndCapture(evTopDir);
+    Check("top lists are cut at 10", EventSummary.FromJsonl(Path.Combine(evTopDir, "gameevents.jsonl")).TopHurts.Count == 10);
+    EventStreamHub.BeginCapture(evClock);
+    string evEmptyDir = Path.Combine(evDir, "empty");
+    Directory.CreateDirectory(evEmptyDir);
+    Check("an empty capture still writes a header and footer file", EventStreamHub.EndCapture(evEmptyDir) == 0 && File.ReadAllLines(Path.Combine(evEmptyDir, "gameevents.jsonl")).Length == 2);
+    var evEmptySum = EventSummary.FromJsonl(Path.Combine(evEmptyDir, "gameevents.jsonl"));
+    Check("empty summary has no first or last and says so", evEmptySum.Rows == 0 && evEmptySum.FirstMs == null && evEmptySum.Markdown().Contains("No events were recorded") && evEmptySum.ToJson()["first_t_ms"] == null);
+
+    // Wiring into the bundle summary
+    var evMeta = new CaptureMeta { MainThreadOsId = 1, QpcFrequency = Stopwatch.Frequency, EndQpc = Stopwatch.Frequency, Bundle = new BundleSummary { StartLocal = "t", SparkVsVersion = "test" } };
+    var evReport = Analyzer.Build(set, evMeta);
+    string evNoFilesDir = Path.Combine(evDir, "nofile");
+    Directory.CreateDirectory(evNoFilesDir);
+    var evHeadNo = JsonDocument.Parse(ReportBuilder.HeadlineJson(evReport, AllocationReport.Disabled("x"), evNoFilesDir)).RootElement;
+    Check("summary.json has no game_events key without the file", !evHeadNo.GetProperty("sections").TryGetProperty("game_events", out _) && !evHeadNo.GetProperty("not_collected").EnumerateArray().Any(e => e.GetString() == "gameevents.jsonl"));
+    string evMdNo = ExtraSections.Markdown(evNoFilesDir);
+    Check("markdown has no Game events section without the file", !evMdNo.Contains("## Game events"));
+    File.Copy(Path.Combine(evSumDir, "gameevents.jsonl"), Path.Combine(evNoFilesDir, "gameevents.jsonl"));
+    var evHeadYes = JsonDocument.Parse(ReportBuilder.HeadlineJson(evReport, AllocationReport.Disabled("x"), evNoFilesDir)).RootElement;
+    Check("summary.json gets the game_events section with the file", evHeadYes.GetProperty("sections").GetProperty("game_events").GetProperty("rows").GetInt32() == 11 && evHeadYes.GetProperty("sections").GetProperty("game_events").GetProperty("by_type").GetProperty("death").GetInt32() == 3);
+    string evMdYes = ExtraSections.Markdown(evNoFilesDir);
+    int evIdx = evMdYes.IndexOf("## Game events", StringComparison.Ordinal);
+    Check("Game events section is appended last", evIdx > evMdYes.IndexOf("## Asset inventory", StringComparison.Ordinal) && evMdYes.IndexOf("\n## ", evIdx + 3, StringComparison.Ordinal) < 0, evMdYes);
+    Check("existing sections keep their names and order", evMdYes.IndexOf("## Chunk pipeline", StringComparison.Ordinal) < evMdYes.IndexOf("## Harmony patch map", StringComparison.Ordinal) && evMdYes.IndexOf("## Harmony patch map", StringComparison.Ordinal) < evMdYes.IndexOf("## Asset inventory", StringComparison.Ordinal));
+    Check("gameevents.jsonl is not in any placeholder or stub list", !BundleWriter.WriterFiles.Contains("gameevents.jsonl") && !CaptureSide.ServerWriterFiles.Contains("gameevents.jsonl") && !CaptureSide.ClientOnlyFiles.Contains("gameevents.jsonl") && !BundleWriter.Stubs.Any(s => s.File == "gameevents.jsonl"));
+    string evPhDir = Path.Combine(evDir, "ph");
+    Directory.CreateDirectory(evPhDir);
+    BundleWriter.WritePlaceholdersForMissing(evPhDir, "r");
+    BundleWriter.WriteStubs(evPhDir);
+    Check("placeholders and stubs never create gameevents.jsonl", !File.Exists(Path.Combine(evPhDir, "gameevents.jsonl")));
+
+    EventStreamHub.Reset();
+    try { Directory.Delete(evDir, true); } catch { }
+}
+
 Console.WriteLine($"tests passed={passed} failed={failed}");
 return failed == 0 ? 0 : 1;
 

@@ -2,7 +2,7 @@
   "type": "code",
   "modid": "sparkvs",
   "name": "SparkVS",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "authors": ["Nick"],
   "description": "On demand sampling profiler: what is the main thread doing, and which mod owns that code. Captures stay on this PC.",
   "side": "Universal",

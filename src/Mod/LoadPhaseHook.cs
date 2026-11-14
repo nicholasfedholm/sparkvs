@@ -50,6 +50,11 @@ internal static class LoadPhaseHook
             Log.MarkFailed("LoadPhases is false in SparkVS.json");
             return;
         }
+        if (AppContext.TryGetSwitch("SparkLoad.Hook.HoldsTryRunModPhase", out var held) && held)
+        {
+            Log.MarkFailed("SparkLoad hook holds ModLoader.TryRunModPhase; SparkVS did not patch it a second time");
+            return;
+        }
         try
         {
             var type = AccessTools.TypeByName("Vintagestory.Common.ModLoader");

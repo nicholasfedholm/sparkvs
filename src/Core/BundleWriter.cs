@@ -237,9 +237,9 @@ public static class BundleWriter
     /// <summary>Files with their own writers. If a writer did not run, a disabled placeholder is written so the bundle layout stays complete.</summary>
     public static readonly string[] WriterFiles = { "allocations.json", "chunk-pipeline.json", "patch-map.json", "asset-inventory.json", "gpu-phases.json" };
 
-    public static void WritePlaceholdersForMissing(string dir, string reason)
+    public static void WritePlaceholdersForMissing(string dir, string reason, IEnumerable<string>? files = null)
     {
-        foreach (var file in WriterFiles)
+        foreach (var file in files ?? WriterFiles)
         {
             string path = Path.Combine(dir, file);
             if (File.Exists(path)) continue;
@@ -409,7 +409,7 @@ public static class BundleWriter
     }
 
     /// <summary>tick.jsonl. When the probe could not be built or saw no ticks the file says enabled false and why.</summary>
-    public static TickStats WriteTick(string dir, TickLog? log, BundleClock clock, string? probeFailure)
+    public static TickStats WriteTick(string dir, TickLog? log, BundleClock clock, string? probeFailure, bool server = false)
     {
         long dropped = 0;
         var entries = log == null ? Array.Empty<TickLog.Entry>() : log.Snapshot(out dropped);
@@ -422,35 +422,53 @@ public static class BundleWriter
             return stats;
         }
 
+        // Rows with no per tick work time (only the tick period is known) carry TickLog.NoMspt and are written as null.
+        bool anyMspt = entries.Any(e => e.MsptMs >= 0);
         var sb = new StringBuilder(1 << 16);
-        var header = JsonNode.Parse(Header("tick", clock,
-            "Integrated server work time per tick, read from the game's own per tick Stopwatch (ServerMain.StatsCollector tickTimes) by a game tick listener on the server thread, one row per completed tick.",
+        string what = server
+            ? (anyMspt
+                ? "Dedicated server work time per tick, read from the game's own per tick Stopwatch (ServerMain.StatsCollector tickTimes) by a game tick listener on the server thread, one row per completed tick. interval_ms is the tick period, so 1000 / interval_ms is the tick rate (TPS)."
+                : "Dedicated server tick period, one row per tick observed by a game tick listener on the server thread. The game's per tick work time (ServerMain.StatsCollector) was not available, so mspt_ms is null; 1000 / interval_ms is the tick rate (TPS).")
+            : "Integrated server work time per tick, read from the game's own per tick Stopwatch (ServerMain.StatsCollector tickTimes) by a game tick listener on the server thread, one row per completed tick.";
+        var header = JsonNode.Parse(Header("tick", clock, what,
             new JsonObject
             {
                 ["ts_local"] = "local time the listener observed the tick",
                 ["t_ms"] = "ms since capture start at observation, which is shortly after the tick it reports",
-                ["mspt_ms"] = "work time of the tick that just completed, whole ms (the game timer has 1 ms resolution)",
+                ["mspt_ms"] = "work time of the tick that just completed, whole ms (the game timer has 1 ms resolution)" + (anyMspt && entries.Any(e => e.MsptMs < 0) ? "; null where unavailable" : anyMspt ? "" : "; null for every row: unavailable" + (probeFailure != null ? " (" + probeFailure + ")" : "")),
                 ["interval_ms"] = "ms since the previous observed tick, null for the first. Equals the tick period including the game's sleep, not work time.",
             }))!.AsObject();
         header["label"] = "experimental";
         header["dropped_oldest_ticks"] = dropped;
+        if (server) header["side"] = CaptureSide.Server;
         sb.Append(header.ToJsonString()).Append('\n');
         foreach (var e in entries)
         {
             double t = clock.MsSince(e.Stamp);
             sb.Append("{\"ts_local\":\"").Append(clock.IsoAt(t)).Append("\",\"t_ms\":").Append(N(t, 1))
-              .Append(",\"mspt_ms\":").Append(e.MsptMs)
+              .Append(",\"mspt_ms\":").Append(e.MsptMs < 0 ? "null" : e.MsptMs.ToString(CultureInfo.InvariantCulture))
               .Append(",\"interval_ms\":").Append(float.IsNaN(e.IntervalMs) ? "null" : N(e.IntervalMs, 1)).Append("}\n");
         }
         File.WriteAllText(Path.Combine(dir, "tick.jsonl"), sb.ToString(), new UTF8Encoding(false));
 
-        var mspt = entries.Select(e => (double)e.MsptMs).OrderBy(v => v).ToArray();
+        var mspt = entries.Where(e => e.MsptMs >= 0).Select(e => (double)e.MsptMs).OrderBy(v => v).ToArray();
         stats.Enabled = true;
-        stats.MeanMsptMs = mspt.Average();
-        stats.P95MsptMs = mspt[Math.Clamp((int)Math.Ceiling(0.95 * mspt.Length) - 1, 0, mspt.Length - 1)];
-        stats.MaxMsptMs = mspt[^1];
-        var intervals = entries.Where(e => !float.IsNaN(e.IntervalMs)).Select(e => (double)e.IntervalMs).ToArray();
+        if (mspt.Length > 0)
+        {
+            stats.MeanMsptMs = mspt.Average();
+            stats.P95MsptMs = mspt[Math.Clamp((int)Math.Ceiling(0.95 * mspt.Length) - 1, 0, mspt.Length - 1)];
+            stats.MaxMsptMs = mspt[^1];
+        }
+        else stats.Reason = probeFailure ?? "no per tick work time source";
+        var intervals = entries.Where(e => !float.IsNaN(e.IntervalMs)).Select(e => (double)e.IntervalMs).OrderBy(v => v).ToArray();
         stats.MeanIntervalMs = intervals.Length > 0 ? intervals.Average() : 0;
+        if (server)
+        {
+            stats.MeanTps = stats.MeanIntervalMs > 0 ? Math.Round(1000.0 / stats.MeanIntervalMs, 3) : null;
+            stats.P95IntervalMs = intervals.Length > 0 ? intervals[Math.Clamp((int)Math.Ceiling(0.95 * intervals.Length) - 1, 0, intervals.Length - 1)] : null;
+            stats.MaxIntervalMs = intervals.Length > 0 ? intervals[^1] : null;
+            stats.MsptSource = mspt.Length > 0 ? "ServerMain.StatsCollector tickTimes" : "unavailable: tick period only";
+        }
         return stats;
     }
 

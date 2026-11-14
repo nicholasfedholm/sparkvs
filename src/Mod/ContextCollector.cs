@@ -73,11 +73,57 @@ internal static class ContextCollector
         return node;
     }
 
+    /// <summary>Server side state at one moment: online players and loaded chunk and entity counts. Server main thread.</summary>
+    public static JsonObject State(ICoreServerAPI sapi, BundleClock clock)
+    {
+        double t = clock.MsSince(Stopwatch.GetTimestamp());
+        var node = new JsonObject { ["ts_local"] = clock.IsoAt(t), ["t_ms"] = Math.Round(t, 1) };
+        try { node["online_players"] = sapi.World.AllOnlinePlayers.Length; } catch (Exception ex) { node["online_players"] = null; node["online_players_error"] = ex.Message; }
+        try { node["loaded_chunks_server"] = sapi.WorldManager.AllLoadedChunks.Count; } catch (Exception ex) { node["loaded_chunks_server"] = null; node["loaded_chunks_server_error"] = ex.Message; }
+        try { node["loaded_entities_server"] = sapi.World.LoadedEntities.Count; } catch (Exception ex) { node["loaded_entities_server"] = null; node["loaded_entities_server_error"] = ex.Message; }
+        return node;
+    }
+
+    /// <summary>World name, seed and world config headline values of a dedicated server. Server main thread.</summary>
+    public static JsonObject World(ICoreServerAPI sapi)
+    {
+        var config = new JsonObject();
+        foreach (var key in WorldConfigKeys)
+        {
+            string? value = null;
+            try { value = sapi.World.Config?.GetAsString(key, null!); } catch { }
+            config[key] = value == null ? null : new JsonObject { ["value"] = value, ["source"] = "server World.Config" };
+        }
+        string? name = null;
+        try { name = Path.GetFileNameWithoutExtension(sapi.WorldManager.CurrentWorldFilepath); } catch { }
+        return new JsonObject
+        {
+            ["name"] = name,
+            ["name_source"] = "server IWorldManagerAPI.CurrentWorldFilepath",
+            ["seed"] = SafeInt(() => sapi.World.Seed),
+            ["savegame_identifier"] = SafeString(() => sapi.WorldManager.SaveGame.SavegameIdentifier),
+            ["single_player"] = false,
+            ["worldconfig_headline"] = config,
+            ["map_size_blocks"] = new JsonObject
+            {
+                ["x"] = SafeInt(() => sapi.WorldManager.MapSizeX),
+                ["y"] = SafeInt(() => sapi.WorldManager.MapSizeY),
+                ["z"] = SafeInt(() => sapi.WorldManager.MapSizeZ),
+            },
+        };
+    }
+
+    static string? SafeString(Func<string> read) { try { return read(); } catch { return null; } }
+
+    /// <summary>A dedicated server has no graphics settings; the file keeps its key so readers do not break.</summary>
+    public static JsonObject GraphicsNotApplicable() =>
+        new JsonObject { ["source"] = "not applicable: this capture was taken on a dedicated server, which has no client graphics settings", ["values"] = new JsonObject() };
+
     /// <summary>
     /// Every mod the process loaded on any side. The client loader omits server-only mods (tungsten), so the integrated server's
     /// loader and the mods the TryRunModPhase hook saw are merged in; each entry says which sides loaded it.
     /// </summary>
-    public static List<ModEntry> ModList(ICoreClientAPI capi)
+    public static List<ModEntry> ModList(ICoreAPI capi)
     {
         var byId = new Dictionary<string, ModEntry>(StringComparer.OrdinalIgnoreCase);
         void Add(string id, string? version, string? path, string type, string side, string? name = null)
@@ -87,8 +133,9 @@ internal static class ContextCollector
             else if (e.Name.Length == 0 && name != null) e.Name = name;
             e.Sides.Add(side);
         }
+        string ownSide = capi.Side == EnumAppSide.Client ? "client" : "server";
         foreach (var mod in capi.ModLoader.Mods)
-            Add(mod.Info.ModID, mod.Info.Version, mod.SourcePath, mod.SourceType.ToString(), "client", mod.Info.Name);
+            Add(mod.Info.ModID, mod.Info.Version, mod.SourcePath, mod.SourceType.ToString(), ownSide, mod.Info.Name);
         try
         {
             var server = ServerInfo.Api;
@@ -173,7 +220,7 @@ internal static class ContextCollector
         return result;
     }
 
-    public static JsonObject Versions(ICoreClientAPI capi, string sparkVsVersion)
+    public static JsonObject Versions(ICoreAPI capi, string sparkVsVersion)
     {
         string? optimum = null;
         string optimumNote = "";
@@ -244,8 +291,8 @@ internal static class ContextCollector
     [DllImport("kernel32.dll")]
     static extern bool GetPhysicallyInstalledSystemMemory(out long kilobytes);
 
-    /// <summary>CPU, GPU, driver, RAM, OS build. Registry and DXGI reads, off thread.</summary>
-    public static JsonObject System()
+    /// <summary>CPU, GPU, driver, RAM, OS build. Registry and DXGI reads, off thread. A dedicated server skips the GPU adapter listing.</summary>
+    public static JsonObject System(bool includeGpu = true)
     {
         var node = new JsonObject();
         string? cpu = null;
@@ -254,6 +301,8 @@ internal static class ContextCollector
         node["cpu_logical_cores"] = Environment.ProcessorCount;
 
         var gpus = new JsonArray();
+        if (!includeGpu) node["gpu_error"] = "not queried: dedicated server capture";
+        else
         try
         {
             using var reader = new GpuMemoryReader(Environment.ProcessId);
@@ -266,7 +315,9 @@ internal static class ContextCollector
         }
         catch (Exception ex) { node["gpu_error"] = ex.GetType().Name + ": " + ex.Message; }
         node["gpus"] = gpus;
-        node["gpu_note"] = "Adapters DXGI lists, hardware only. Which one the game renders on is shown by the adapter field in gpu-memory.jsonl.";
+        node["gpu_note"] = includeGpu
+            ? "Adapters DXGI lists, hardware only. Which one the game renders on is shown by the adapter field in gpu-memory.jsonl."
+            : "A dedicated server does not render, so no GPU adapters are listed and there is no gpu-memory.jsonl.";
 
         long? ram = null;
         try { if (GetPhysicallyInstalledSystemMemory(out long kb)) ram = kb * 1024; } catch { }

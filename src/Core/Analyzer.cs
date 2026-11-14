@@ -50,7 +50,7 @@ public static class Analyzer
             threads.Add(BuildThread(kv.Key, kv.Value, set, attribution, meta));
 
         var ordered = threads
-            .OrderByDescending(t => t.Role == "client-main")
+            .OrderByDescending(t => t.Role == CaptureSide.MainRole(meta.Side))
             .ThenByDescending(t => t.Role == "server")
             .ThenByDescending(t => t.DurationMs * (100 - t.IdlePct))
             .Take(maxThreads)
@@ -64,7 +64,10 @@ public static class Analyzer
             StartedLocal = meta.StartedLocal,
             DurationSec = durationMs / 1000.0,
             SamplingRateKnob = meta.SamplingRateKnob,
-            ScopeNote = meta.IntegratedServer
+            Side = CaptureSide.IsServer(meta.Side) ? CaptureSide.Server : null,
+            ScopeNote = CaptureSide.IsServer(meta.Side)
+                ? "Dedicated server process only. Captured in process by the SparkVS server side: there is no render loop, frame hook or GPU here, and no client is profiled."
+                : meta.IntegratedServer
                 ? "Client process only. Server threads are the integrated singleplayer server in this same process; this is not remote dedicated server profiling."
                 : "Client process only. No server thread in this process (connected to a remote server, which is not profiled).",
             TotalSamples = set.Samples.Count,
@@ -90,7 +93,11 @@ public static class Analyzer
             report.Bundle = meta.Bundle;
         }
 
-        if (byThread.TryGetValue(meta.MainThreadOsId, out var mainSamples))
+        int mainId = meta.MainThreadOsId;
+        // A server whose tick thread id is unknown (non Windows) is found by its ServerMain stack role instead.
+        if (CaptureSide.IsServer(meta.Side) && !byThread.ContainsKey(mainId))
+            mainId = threads.FirstOrDefault(t => t.Role == "server")?.OsThreadId ?? mainId;
+        if (byThread.TryGetValue(mainId, out var mainSamples))
         {
             report.MainThreadSamples = mainSamples.Count;
             int ok = mainSamples.Count(s => StackResolved(set, s.StackId));
@@ -143,6 +150,14 @@ public static class Analyzer
         return false;
     }
 
+    /// <summary>The capture's main thread: the render thread of a client, the tick thread of a server (found by its ServerMain stack when its OS id is unknown).</summary>
+    public static ThreadReport? FindMain(Report r)
+    {
+        string role = CaptureSide.MainRole(r.Side);
+        return r.Threads.FirstOrDefault(t => t.Role == role)
+            ?? (CaptureSide.IsServer(r.Side) ? r.Threads.FirstOrDefault(t => t.Role == "server") : null);
+    }
+
     static string? RoleOfStack(int[] stack, List<FrameInfo> frames)
     {
         foreach (var f in stack)
@@ -157,7 +172,7 @@ public static class Analyzer
 
     static string RoleOf(int threadId, List<Sample> samples, SampleSet set, CaptureMeta meta)
     {
-        if (threadId == meta.MainThreadOsId) return "client-main";
+        if (threadId != 0 && threadId == meta.MainThreadOsId) return CaptureSide.MainRole(meta.Side);
         if (threadId != 0 && threadId == meta.ServerThreadOsId) return "server";
 
         var roleByStack = new Dictionary<int, string?>();
